@@ -1,0 +1,7 @@
+dialect:mssql
+host:db-host.example.local
+db_name:example_db
+port:1433
+username:example_user
+password:change_me
+driver:ODBC Driver 18 for SQL Server
