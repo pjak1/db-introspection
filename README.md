@@ -36,6 +36,11 @@ Server accepts both separators (`/` and `\`) in input, but `db_list_connections(
 - `db_list_connections()`
 - `db_list_tables(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema")`
+- `db_list_constraints(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table", constraint_type="PRIMARY KEY")`
+- `db_list_sequences(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
+- `db_list_procedures(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
+- `db_list_functions(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
+- `db_list_jobs(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_sample_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema")`
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema")`
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns="id,name", schema="some_schema")` (CSV is also supported)
