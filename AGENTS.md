@@ -31,6 +31,10 @@ Use `db_run_select` only as a last resort (fallback) for requests that cannot be
 - Don't: "ukaz data z tabulky X" -> `db_run_select`
 - Do: "ukaz data z tabulky X" -> `db_sample_table`
 
+## Output formatting
+
+- Data ziskana z DB vypisuj prosim ve forme tabulky.
+
 ## Implementation constraints
 
 - Keep `server.py` and `src/services/*` behavior unchanged for this policy.

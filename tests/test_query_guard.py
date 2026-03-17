@@ -51,6 +51,24 @@ def test_prepare_select_truncates_limit():
     assert result.warnings
 
 
+def test_validate_select_returns_original_sql_without_extra_whitespace():
+    guard = QueryGuard(max_select_limit=200, dialect="postgres")
+    result = guard.validate_select("  SELECT * FROM users  ")
+    assert result == "SELECT * FROM users"
+
+
+def test_validate_select_rejects_ddl_for_explain_path():
+    guard = QueryGuard(max_select_limit=200, dialect="postgres")
+    with pytest.raises(ValidationError):
+        guard.validate_select("DROP TABLE users")
+
+
+def test_validate_select_rejects_multi_statement_for_explain_path():
+    guard = QueryGuard(max_select_limit=200, dialect="postgres")
+    with pytest.raises(ValidationError):
+        guard.validate_select("SELECT 1; SELECT 2")
+
+
 def test_prepare_select_rejects_unsupported_dialect():
     with pytest.raises(ValidationError):
         QueryGuard(max_select_limit=200, dialect="sqlite")

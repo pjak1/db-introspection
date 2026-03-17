@@ -85,6 +85,9 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
         def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[{"dsn": self._dsn, "sql_query": sql_query}])
 
+        def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+            return AdapterResult(data=[{"plan_text": sql_query}], status="explain")
+
     DynamicAdapter.dialect_name = dialect
     DatabaseAdapter._registry[dialect] = DynamicAdapter
 
@@ -152,6 +155,9 @@ def test_adapter_class_registers_automatically():
             return AdapterResult(data=[])
 
         def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+            return AdapterResult(data=[])
+
+        def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[])
 
     try:

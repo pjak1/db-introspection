@@ -133,8 +133,8 @@ class QueryGuard:
                 f"Unsupported SQL dialect for query guard: {dialect}",
             )
 
-    def prepare_select(self, sql_query: str, limit: int | None = None) -> GuardedQuery:
-        """Validate SQL as single read-only statement and enforce result limit."""
+    def validate_select(self, sql_query: str) -> str:
+        """Validate SQL as a single read-only statement and return normalized text."""
         if not sql_query or not sql_query.strip():
             raise ValidationError("invalid_sql", "SQL query cannot be empty.")
 
@@ -164,14 +164,18 @@ class QueryGuard:
                     f"SQL contains forbidden keyword: {keyword}",
                 )
 
-        requested_limit = self._max_select_limit if limit is None else max(
-            1, int(limit))
+        return sql_query.strip().rstrip(";").rstrip()
+
+    def prepare_select(self, sql_query: str, limit: int | None = None) -> GuardedQuery:
+        """Validate SQL as single read-only statement and enforce result limit."""
+        validated_sql = self.validate_select(sql_query)
+
+        requested_limit = self._max_select_limit if limit is None else max(1, int(limit))
         applied_limit = min(requested_limit, self._max_select_limit)
         truncated = requested_limit > self._max_select_limit
 
-        query = sql_query.strip().rstrip(";")
         wrapped = self._adapter_class.wrap_select(
-            query=query, limit=applied_limit)
+            query=validated_sql, limit=applied_limit)
         warnings: list[str] = []
         if truncated:
             warnings.append(

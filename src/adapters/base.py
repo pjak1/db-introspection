@@ -131,3 +131,8 @@ class DatabaseAdapter(ABC):
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         """Execute a read-only SQL query with timeout controls."""
         raise NotImplementedError
+
+    @abstractmethod
+    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+        """Return an estimated execution plan for a validated read-only SQL query."""
+        raise NotImplementedError

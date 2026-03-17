@@ -58,6 +58,9 @@ class DummyAdapter(DatabaseAdapter):
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         return AdapterResult(data=[])
 
+    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+        return AdapterResult(data=[])
+
 
 def _single_schema_settings() -> Settings:
     return Settings(

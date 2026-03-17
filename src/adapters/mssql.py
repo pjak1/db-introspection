@@ -95,6 +95,56 @@ class MssqlAdapter(DatabaseAdapter):
         """Safely quote SQL Server identifiers using brackets."""
         return f"[{identifier.replace(']', ']]')}]"
 
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        """Convert SQL Server metadata values to ints when available."""
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    def _with_full_data_type(self, rows: list[dict]) -> list[dict]:
+        """Attach formatted SQL Server type names and strip helper metadata."""
+        formatted_rows: list[dict] = []
+        for row in rows:
+            data_type = str(row.get("data_type") or "")
+            normalized_type = data_type.lower()
+            char_length = self._int_or_none(row.get("_character_maximum_length"))
+            numeric_precision = self._int_or_none(row.get("_numeric_precision"))
+            numeric_scale = self._int_or_none(row.get("_numeric_scale"))
+            datetime_precision = self._int_or_none(row.get("_datetime_precision"))
+
+            full_data_type = data_type
+            if normalized_type in {"char", "varchar", "binary", "varbinary", "nchar", "nvarchar"}:
+                if char_length is not None:
+                    size = "max" if char_length == -1 else str(char_length)
+                    full_data_type = f"{data_type}({size})"
+            elif normalized_type in {"decimal", "numeric"}:
+                if numeric_precision is not None:
+                    scale = 0 if numeric_scale is None else numeric_scale
+                    full_data_type = f"{data_type}({numeric_precision},{scale})"
+            elif normalized_type in {"datetime2", "datetimeoffset", "time"}:
+                if datetime_precision is not None:
+                    full_data_type = f"{data_type}({datetime_precision})"
+
+            public_row = {
+                key: value for key, value in row.items() if not key.startswith("_")
+            }
+            public_row["full_data_type"] = full_data_type
+            formatted_rows.append(public_row)
+        return formatted_rows
+
+    @staticmethod
+    def _normalize_explain_rows(columns: list[str], fetched_rows: list[tuple[Any, ...]]) -> list[dict]:
+        """Map SQL Server SHOWPLAN rows to the common public plan row shape."""
+        stmt_index = 0
+        for idx, column in enumerate(columns):
+            if str(column).lower() == "stmttext":
+                stmt_index = idx
+                break
+        return normalize_rows(
+            [{"plan_text": row[stmt_index]} for row in fetched_rows]
+        )
+
     def _fetch_all(
         self,
         query: str,
@@ -156,13 +206,17 @@ class MssqlAdapter(DatabaseAdapter):
                 DATA_TYPE AS data_type,
                 DATA_TYPE AS udt_name,
                 CASE IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END AS is_nullable,
-                COLUMN_DEFAULT AS column_default
+                COLUMN_DEFAULT AS column_default,
+                CHARACTER_MAXIMUM_LENGTH AS _character_maximum_length,
+                NUMERIC_PRECISION AS _numeric_precision,
+                NUMERIC_SCALE AS _numeric_scale,
+                DATETIME_PRECISION AS _datetime_precision
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_NAME = ?
               AND TABLE_SCHEMA IN ({in_clause})
             ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
         """
-        data = self._fetch_all(query, (table,) + params)
+        data = self._with_full_data_type(self._fetch_all(query, (table,) + params))
         return AdapterResult(data=data)
 
     def list_constraints(
@@ -342,3 +396,41 @@ class MssqlAdapter(DatabaseAdapter):
         """Run a read-only SQL query with timeout controls when supported."""
         data = self._fetch_all(sql_query, timeout_ms=timeout_ms)
         return AdapterResult(data=data)
+
+    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+        """Return a SQL Server estimated execution plan for a validated SELECT."""
+        try:
+            with self._connect() as conn:
+                conn.timeout = max(1, int(timeout_ms) // 1000)
+                with conn.cursor() as cur:
+                    cur.execute("SET SHOWPLAN_TEXT ON")
+                    execution_error: Exception | None = None
+                    collected_rows: list[dict] = []
+                    try:
+                        cur.execute(sql_query)
+                        while True:
+                            if cur.description is not None:
+                                columns = [desc[0] for desc in cur.description]
+                                collected_rows.extend(
+                                    self._normalize_explain_rows(columns, cur.fetchall())
+                                )
+                            if not cur.nextset():
+                                break
+                    except Exception as exc:
+                        execution_error = exc
+                    try:
+                        cur.execute("SET SHOWPLAN_TEXT OFF")
+                    except Exception as off_exc:
+                        if execution_error is None:
+                            raise off_exc
+                    if execution_error is not None:
+                        raise execution_error
+                    return AdapterResult(data=collected_rows, status="explain")
+        except DatabaseError:
+            raise
+        except Exception as exc:
+            raise DatabaseError(
+                "database_error",
+                "MSSQL explain plan failed.",
+                details=str(exc),
+            ) from exc

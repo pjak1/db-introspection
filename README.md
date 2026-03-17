@@ -36,6 +36,7 @@ Server accepts both separators (`/` and `\`) in input, but `db_list_connections(
 - `db_list_connections()`
 - `db_list_tables(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema")`
+- `db_list_columns(...)` now includes `full_data_type` alongside the existing raw type fields.
 - `db_list_constraints(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table", constraint_type="PRIMARY KEY")`
 - `db_list_sequences(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_procedures(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
@@ -45,8 +46,10 @@ Server accepts both separators (`/` and `\`) in input, but `db_list_connections(
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema")`
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns="id,name", schema="some_schema")` (CSV is also supported)
 - `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1")` (advanced/fallback)
+- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", explain=True)` returns an estimated execution plan as rows with `plan_text`.
 
 `schema` is required for introspection and table-preview tools and is always validated against `allowed_schemas` for the selected connection.
+When `db_run_select(..., explain=True)` is used, the original validated SQL is planned without applying the tool `limit`; if `limit` is provided it is ignored and reported as a warning.
 
 ## Install in Codex (VS Code)
 

@@ -112,6 +112,58 @@ class OracleAdapter(DatabaseAdapter):
         """Safely quote Oracle identifiers using double quotes."""
         return f"\"{identifier.replace('\"', '\"\"')}\""
 
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        """Convert Oracle numeric metadata values to ints when available."""
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    def _with_full_data_type(self, rows: list[dict]) -> list[dict]:
+        """Attach formatted Oracle type names and strip internal helper columns."""
+        formatted_rows: list[dict] = []
+        for row in rows:
+            data_type = str(row.get("data_type") or "")
+            normalized_type = data_type.upper()
+            char_used = str(row.get("helper_char_used") or "").upper()
+            char_length = self._int_or_none(row.get("helper_char_length"))
+            data_length = self._int_or_none(row.get("helper_data_length"))
+            data_precision = self._int_or_none(row.get("helper_data_precision"))
+            data_scale = self._int_or_none(row.get("helper_data_scale"))
+
+            full_data_type = data_type
+            if normalized_type in {"CHAR", "VARCHAR2"}:
+                if char_used == "C" and char_length is not None:
+                    full_data_type = f"{data_type}({char_length} CHAR)"
+                elif char_used == "B" and data_length is not None:
+                    full_data_type = f"{data_type}({data_length} BYTE)"
+                elif char_length is not None:
+                    full_data_type = f"{data_type}({char_length})"
+            elif normalized_type in {"NCHAR", "NVARCHAR2"}:
+                if char_length is not None:
+                    full_data_type = f"{data_type}({char_length})"
+            elif normalized_type == "RAW":
+                if data_length is not None:
+                    full_data_type = f"{data_type}({data_length})"
+            elif normalized_type == "NUMBER":
+                if data_precision is not None and data_scale is None:
+                    full_data_type = f"{data_type}({data_precision})"
+                elif data_precision is not None and data_scale == 0:
+                    full_data_type = f"{data_type}({data_precision})"
+                elif data_precision is not None and data_scale is not None:
+                    full_data_type = f"{data_type}({data_precision},{data_scale})"
+                elif data_precision is None and data_scale is not None:
+                    full_data_type = f"{data_type}(*,{data_scale})"
+
+            public_row = {
+                key: value
+                for key, value in row.items()
+                if not key.startswith("helper_")
+            }
+            public_row["full_data_type"] = full_data_type
+            formatted_rows.append(public_row)
+        return formatted_rows
+
     def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
         """List tables and views available in selected schemas."""
         in_clause, params = self._schema_params(schemas)
@@ -151,13 +203,18 @@ class OracleAdapter(DatabaseAdapter):
                 data_type,
                 data_type AS udt_name,
                 CASE nullable WHEN 'Y' THEN 1 ELSE 0 END AS is_nullable,
-                data_default AS column_default
+                data_default AS column_default,
+                char_used AS helper_char_used,
+                char_length AS helper_char_length,
+                data_length AS helper_data_length,
+                data_precision AS helper_data_precision,
+                data_scale AS helper_data_scale
             FROM all_tab_columns
             WHERE table_name = :table_name
               AND owner IN ({in_clause})
             ORDER BY owner, table_name, column_id
         """
-        data = self._fetch_all(query, params)
+        data = self._with_full_data_type(self._fetch_all(query, params))
         return AdapterResult(data=data)
 
     def list_constraints(
@@ -344,3 +401,29 @@ class OracleAdapter(DatabaseAdapter):
         """Run a read-only SQL query with timeout controls when supported."""
         data = self._fetch_all(sql_query, timeout_ms=timeout_ms)
         return AdapterResult(data=data)
+
+    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+        """Return an Oracle estimated execution plan for a validated SELECT."""
+        try:
+            with self._connect() as conn:
+                if hasattr(conn, "call_timeout"):
+                    setattr(conn, "call_timeout", int(timeout_ms))
+                if hasattr(conn, "callTimeout"):
+                    setattr(conn, "callTimeout", int(timeout_ms))
+                with conn.cursor() as cur:
+                    cur.execute(f"EXPLAIN PLAN FOR {sql_query}")
+                    cur.execute(
+                        "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY())"
+                    )
+                    data = normalize_rows(
+                        [{"plan_text": row[0]} for row in cur.fetchall()]
+                    )
+                    return AdapterResult(data=data, status="explain")
+        except DatabaseError:
+            raise
+        except Exception as exc:
+            raise DatabaseError(
+                "database_error",
+                "Oracle explain plan failed.",
+                details=str(exc),
+            ) from exc

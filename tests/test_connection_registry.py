@@ -62,6 +62,9 @@ class DummyAdapter(DatabaseAdapter):
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         return AdapterResult(data=[])
 
+    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+        return AdapterResult(data=[])
+
 
 def _write_conn(path: Path, *, schema: str = "public") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

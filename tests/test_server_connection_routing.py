@@ -78,6 +78,7 @@ class FakeSelectService:
         sql_query: str,
         limit: int | None,
         timeout_ms: int | None,
+        explain: bool = False,
     ) -> dict:
         return {
             "ok": True,
@@ -85,6 +86,7 @@ class FakeSelectService:
             "sql_query": sql_query,
             "limit": limit,
             "timeout_ms": timeout_ms,
+            "explain": explain,
         }
 
 
@@ -137,6 +139,20 @@ def test_db_select_columns_accepts_csv_columns(monkeypatch):
     assert result["ok"] is True
     assert result["called"] == "select_columns"
     assert result["columns"] == ["id", "name", "email"]
+
+
+def test_db_run_select_routes_explain_flag(monkeypatch):
+    monkeypatch.setattr(server, "connection_registry", FakeRegistry())
+
+    result = server.db_run_select(
+        connection="A/DEV/dbo",
+        sql="SELECT 1",
+        explain=True,
+    )
+
+    assert result["ok"] is True
+    assert result["called"] == "run_select"
+    assert result["explain"] is True
 
 
 def test_db_tool_returns_validation_error_for_empty_connection(monkeypatch):

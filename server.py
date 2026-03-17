@@ -244,14 +244,16 @@ def db_run_select(
     sql: str = "",
     limit: int | None = None,
     timeout_ms: int | None = None,
+    explain: bool = False,
 ) -> Envelope:
-    """Run a guarded read-only SELECT query with enforced limits."""
+    """Run a guarded read-only SELECT query or return its estimated plan."""
     return _with_services(
         connection,
         lambda _, select_service: select_service.run_select(
             sql_query=sql,
             limit=limit,
             timeout_ms=timeout_ms,
+            explain=explain,
         ),
     )
 

@@ -104,14 +104,39 @@ class PostgresAdapter(DatabaseAdapter):
                 cols.data_type,
                 cols.udt_name,
                 (cols.is_nullable = 'YES') AS is_nullable,
-                cols.column_default
+                cols.column_default,
+                pg_catalog.format_type(attr.atttypid, attr.atttypmod) AS full_data_type
             FROM information_schema.columns cols
+            JOIN pg_catalog.pg_namespace ns
+              ON ns.nspname = cols.table_schema
+            JOIN pg_catalog.pg_class cls
+              ON cls.relname = cols.table_name
+             AND cls.relnamespace = ns.oid
+             AND cls.relkind IN ('r', 'v', 'm', 'f', 'p')
+            JOIN pg_catalog.pg_attribute attr
+              ON attr.attrelid = cls.oid
+             AND attr.attname = cols.column_name
+             AND attr.attnum > 0
+             AND NOT attr.attisdropped
             WHERE cols.table_name = %s
               AND cols.table_schema = ANY(%s)
             ORDER BY cols.table_schema, cols.table_name, cols.ordinal_position
         """
         data = self._fetch_all(query, (table, list(schemas)))
         return AdapterResult(data=data)
+
+    @staticmethod
+    def _normalize_explain_rows(rows: list[dict]) -> list[dict]:
+        """Map PostgreSQL EXPLAIN rows to the common public plan row shape."""
+        normalized: list[dict] = []
+        for row in rows:
+            plan_text = row.get("QUERY PLAN")
+            if plan_text is None:
+                plan_text = row.get("query_plan")
+            if plan_text is None and row:
+                plan_text = next(iter(row.values()))
+            normalized.append({"plan_text": plan_text})
+        return normalize_rows(normalized)
 
     def list_constraints(
         self,
@@ -306,3 +331,14 @@ class PostgresAdapter(DatabaseAdapter):
         """Run a read-only SQL query with statement timeout applied."""
         data = self._fetch_all(sql_query, timeout_ms=timeout_ms)
         return AdapterResult(data=data)
+
+    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
+        """Return a PostgreSQL estimated execution plan for a validated SELECT."""
+        data = self._fetch_all(
+            f"EXPLAIN (FORMAT TEXT) {sql_query}",
+            timeout_ms=timeout_ms,
+        )
+        return AdapterResult(
+            data=self._normalize_explain_rows(data),
+            status="explain",
+        )
