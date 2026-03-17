@@ -26,14 +26,14 @@ Use `db_run_select` only as a last resort (fallback) for requests that cannot be
 
 ## Do / Don't examples
 
-- Don't: "vypis tabulky" -> `db_run_select`
-- Do: "vypis tabulky" -> `db_list_tables`
-- Don't: "ukaz data z tabulky X" -> `db_run_select`
-- Do: "ukaz data z tabulky X" -> `db_sample_table`
+- Don't: "list tables" -> `db_run_select`
+- Do: "list tables" -> `db_list_tables`
+- Don't: "show data from table X" -> `db_run_select`
+- Do: "show data from table X" -> `db_sample_table`
 
 ## Output formatting
 
-- Data ziskana z DB vypisuj prosim ve forme tabulky.
+- Please present data obtained from the DB in table form.
 
 ## Implementation constraints
 
