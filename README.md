@@ -36,8 +36,11 @@ Server accepts both separators (`/` and `\`) in input, but `db_list_connections(
 - `db_list_connections()`
 - `db_list_tables(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema")`
-- `db_list_columns(...)` now includes `full_data_type` alongside the existing raw type fields.
+- `db_list_columns(...)` now includes `full_data_type` and a `comment` column (object/column descriptions) alongside the existing raw type fields.
 - `db_list_constraints(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table", constraint_type="PRIMARY KEY")`
+- `db_list_indexes(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table")` lists indexes (uniqueness, primary-key flag, type, indexed columns); `table` is optional.
+- `db_get_ddl(connection="PROJECT_A/DEV/schema_a", schema="some_schema", object_name="some_view", object_type="view")` returns the object DDL/source as a row with a `ddl` field. `object_type` is one of `table`, `view`, `procedure`, `function`. Table DDL is only available on Oracle; on PostgreSQL/SQL Server combine `db_list_columns`, `db_list_constraints` and `db_list_indexes` for tables.
+- `db_search_objects(connection="PROJECT_A/DEV/schema_a", schema="some_schema", pattern="usr", object_types=["table", "view"])` finds objects by case-insensitive name substring. `object_types` accepts a list or CSV string from `table`, `view`, `sequence`, `procedure`, `function` and defaults to all of them.
 - `db_list_sequences(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_procedures(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_functions(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
@@ -84,9 +87,12 @@ Windows note: if `codex` fails due to PowerShell execution policy (`codex.ps1`),
 
 Prefer specialized tools whenever possible:
 
-1. `db_list_tables` for table discovery.
+1. `db_list_tables` for table discovery, or `db_search_objects` to locate objects by partial name across all object types.
 2. `db_list_columns` for column discovery.
-3. `db_list_constraints`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs` for metadata.
-4. `db_sample_table` for row previews from one table.
-5. `db_select_columns` for selecting explicit columns from one table.
-6. `db_run_select` only as fallback for advanced SQL (JOIN, CTE, aggregates, complex filters, window functions).
+3. `db_list_constraints`, `db_list_indexes`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs` for metadata.
+4. `db_get_ddl` to read the source/definition of a view, procedure or function (and tables on Oracle).
+5. `db_sample_table` for row previews from one table.
+6. `db_select_columns` for selecting explicit columns from one table.
+7. `db_run_select` only as fallback for advanced SQL (JOIN, CTE, aggregates, complex filters, window functions).
+
+All tools are read-only and are advertised to MCP clients with `readOnlyHint=true` / `destructiveHint=false` annotations.

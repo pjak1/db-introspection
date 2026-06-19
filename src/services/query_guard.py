@@ -12,6 +12,7 @@ _FORBIDDEN_KEYWORDS = (
     "insert",
     "update",
     "delete",
+    "merge",
     "alter",
     "drop",
     "create",

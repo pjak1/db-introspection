@@ -79,16 +79,23 @@ class PostgresAdapter(DatabaseAdapter):
         """List tables and views available in selected schemas."""
         query = """
             SELECT
-                table_schema AS schema,
-                table_name,
-                table_type
-            FROM information_schema.tables
-            WHERE table_schema = ANY(%s)
+                t.table_schema AS schema,
+                t.table_name,
+                t.table_type,
+                (
+                    SELECT obj_description(c.oid, 'pg_class')
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = t.table_schema
+                      AND c.relname = t.table_name
+                ) AS table_comment
+            FROM information_schema.tables t
+            WHERE t.table_schema = ANY(%s)
               AND (
                     %s
-                    OR (table_schema NOT LIKE 'pg_%%' AND table_schema <> 'information_schema')
+                    OR (t.table_schema NOT LIKE 'pg_%%' AND t.table_schema <> 'information_schema')
               )
-            ORDER BY table_schema, table_name
+            ORDER BY t.table_schema, t.table_name
         """
         data = self._fetch_all(query, (list(schemas), include_system))
         return AdapterResult(data=data)
@@ -105,7 +112,8 @@ class PostgresAdapter(DatabaseAdapter):
                 cols.udt_name,
                 (cols.is_nullable = 'YES') AS is_nullable,
                 cols.column_default,
-                pg_catalog.format_type(attr.atttypid, attr.atttypmod) AS full_data_type
+                pg_catalog.format_type(attr.atttypid, attr.atttypmod) AS full_data_type,
+                pg_catalog.col_description(cls.oid, attr.attnum) AS comment
             FROM information_schema.columns cols
             JOIN pg_catalog.pg_namespace ns
               ON ns.nspname = cols.table_schema
@@ -278,6 +286,118 @@ class PostgresAdapter(DatabaseAdapter):
                 warning = "PostgreSQL cron catalog (pg_cron) is not available for this database/user."
                 return AdapterResult(data=[], warnings=[warning], status="not_available")
             raise
+
+    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List indexes for selected schemas, optionally filtered by table."""
+        query = """
+            SELECT
+                n.nspname AS schema,
+                t.relname AS table_name,
+                i.relname AS index_name,
+                ix.indisunique AS is_unique,
+                ix.indisprimary AS is_primary,
+                am.amname AS index_type,
+                (
+                    SELECT string_agg(
+                        pg_get_indexdef(ix.indexrelid, k.i + 1, true),
+                        ', ' ORDER BY k.i
+                    )
+                    FROM generate_subscripts(ix.indkey, 1) AS k(i)
+                ) AS columns,
+                pg_get_indexdef(ix.indexrelid) AS definition
+            FROM pg_catalog.pg_index ix
+            JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_catalog.pg_am am ON am.oid = i.relam
+            WHERE n.nspname = ANY(%s)
+        """
+        params: list[Any] = [list(schemas)]
+        normalized_table = table.strip() if isinstance(table, str) else None
+        if normalized_table:
+            query += "\n  AND t.relname = %s"
+            params.append(normalized_table)
+        query += "\n            ORDER BY n.nspname, t.relname, i.relname"
+        data = self._fetch_all(query, tuple(params))
+        return AdapterResult(data=data, status="available")
+
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+        """Return the DDL of a view, function or procedure (tables not supported)."""
+        normalized_type = object_type.strip().lower()
+        if normalized_type == "view":
+            query = """
+                SELECT 'view' AS object_type, n.nspname AS schema, c.relname AS object_name,
+                       pg_get_viewdef(c.oid, true) AS ddl
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('v', 'm')
+            """
+            data = self._fetch_all(query, (schema, object_name))
+        elif normalized_type in {"function", "procedure"}:
+            prokind = "p" if normalized_type == "procedure" else "f"
+            query = """
+                SELECT %s AS object_type, n.nspname AS schema, p.proname AS object_name,
+                       pg_get_functiondef(p.oid) AS ddl
+                FROM pg_catalog.pg_proc p
+                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = %s AND p.proname = %s AND p.prokind = %s
+                ORDER BY p.oid
+            """
+            data = self._fetch_all(query, (normalized_type, schema, object_name, prokind))
+        else:
+            return AdapterResult(
+                data=[],
+                warnings=[
+                    "PostgreSQL DDL retrieval supports object_type 'view', 'function' or "
+                    "'procedure'. For tables use db_list_columns, db_list_constraints and "
+                    "db_list_indexes."
+                ],
+                status="not_supported",
+            )
+        if not data:
+            return AdapterResult(
+                data=[],
+                warnings=[f"No {normalized_type} '{schema}.{object_name}' found."],
+                status="not_found",
+            )
+        return AdapterResult(data=data, status="available")
+
+    def search_objects(
+        self,
+        schemas: tuple[str, ...],
+        pattern: str,
+        object_types: tuple[str, ...],
+    ) -> AdapterResult:
+        """Search objects by case-insensitive name substring across selected schemas."""
+        query = """
+            SELECT o.schema, o.object_name, o.object_type
+            FROM (
+                SELECT table_schema AS schema, table_name AS object_name,
+                       CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS object_type
+                FROM information_schema.tables
+                WHERE table_schema = ANY(%s)
+                UNION ALL
+                SELECT schemaname, sequencename, 'sequence'
+                FROM pg_catalog.pg_sequences
+                WHERE schemaname = ANY(%s)
+                UNION ALL
+                SELECT n.nspname, p.proname,
+                       CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END
+                FROM pg_catalog.pg_proc p
+                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = ANY(%s) AND p.prokind IN ('f', 'p')
+            ) o
+            WHERE o.object_name ILIKE %s
+              AND o.object_type = ANY(%s)
+            ORDER BY o.schema, o.object_type, o.object_name
+        """
+        schema_list = list(schemas)
+        like = f"%{pattern}%"
+        data = self._fetch_all(
+            query,
+            (schema_list, schema_list, schema_list, like, list(object_types)),
+        )
+        return AdapterResult(data=data, status="available")
 
     def sample_table(
         self,

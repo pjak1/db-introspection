@@ -59,6 +59,42 @@ class DatabaseAdapter(ABC):
         """Wrap a SELECT query to enforce a maximum number of returned rows."""
         return f"SELECT * FROM ({query}) AS mcp_subquery LIMIT {int(limit)}"
 
+    # Object types understood by search_objects across all dialects.
+    searchable_object_types: ClassVar[tuple[str, ...]] = (
+        "table",
+        "view",
+        "sequence",
+        "procedure",
+        "function",
+    )
+    # Object types understood by get_ddl across all dialects.
+    ddl_object_types: ClassVar[tuple[str, ...]] = (
+        "table",
+        "view",
+        "procedure",
+        "function",
+    )
+
+    @abstractmethod
+    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List indexes for the given schema scope, optionally filtered by table."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+        """Return the DDL/source of a database object."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def search_objects(
+        self,
+        schemas: tuple[str, ...],
+        pattern: str,
+        object_types: tuple[str, ...],
+    ) -> AdapterResult:
+        """Search objects by name substring within the given schema scope."""
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def dialect(self) -> str:

@@ -175,12 +175,18 @@ class OracleAdapter(DatabaseAdapter):
             view_params[key] = schema
         excluded = "AND owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'MDSYS', 'CTXSYS')"
         query = f"""
-            SELECT owner AS schema, table_name, 'BASE TABLE' AS table_type
+            SELECT owner AS schema, table_name, 'BASE TABLE' AS table_type,
+                (SELECT comments FROM all_tab_comments tc
+                  WHERE tc.owner = all_tables.owner
+                    AND tc.table_name = all_tables.table_name) AS table_comment
             FROM all_tables
             WHERE owner IN ({in_clause})
             {" " if include_system else excluded}
             UNION ALL
-            SELECT owner AS schema, view_name AS table_name, 'VIEW' AS table_type
+            SELECT owner AS schema, view_name AS table_name, 'VIEW' AS table_type,
+                (SELECT comments FROM all_tab_comments tc
+                  WHERE tc.owner = all_views.owner
+                    AND tc.table_name = all_views.view_name) AS table_comment
             FROM all_views
             WHERE owner IN ({", ".join(in_clause_views)})
             {" " if include_system else excluded}
@@ -204,6 +210,10 @@ class OracleAdapter(DatabaseAdapter):
                 data_type AS udt_name,
                 CASE nullable WHEN 'Y' THEN 1 ELSE 0 END AS is_nullable,
                 data_default AS column_default,
+                (SELECT comments FROM all_col_comments cc
+                  WHERE cc.owner = all_tab_columns.owner
+                    AND cc.table_name = all_tab_columns.table_name
+                    AND cc.column_name = all_tab_columns.column_name) AS comment,
                 char_used AS helper_char_used,
                 char_length AS helper_char_length,
                 data_length AS helper_data_length,
@@ -356,6 +366,124 @@ class OracleAdapter(DatabaseAdapter):
                     status="not_available",
                 )
             raise
+
+    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List indexes for selected schemas, optionally filtered by table."""
+        in_clause, params = self._schema_params(schemas)
+        params["table_name"] = table.upper() if table else None
+        query = f"""
+            SELECT
+                i.owner AS schema,
+                i.table_name,
+                i.index_name,
+                CASE i.uniqueness WHEN 'UNIQUE' THEN 1 ELSE 0 END AS is_unique,
+                CASE WHEN c.constraint_type = 'P' THEN 1 ELSE 0 END AS is_primary,
+                i.index_type,
+                LISTAGG(col.column_name, ', ')
+                    WITHIN GROUP (ORDER BY col.column_position) AS columns
+            FROM all_indexes i
+            LEFT JOIN all_ind_columns col
+              ON i.owner = col.index_owner
+             AND i.index_name = col.index_name
+            LEFT JOIN all_constraints c
+              ON c.owner = i.owner
+             AND c.index_name = i.index_name
+             AND c.constraint_type = 'P'
+            WHERE i.owner IN ({in_clause})
+              AND (:table_name IS NULL OR i.table_name = :table_name)
+            GROUP BY i.owner, i.table_name, i.index_name, i.uniqueness,
+                     i.index_type, c.constraint_type
+            ORDER BY i.owner, i.table_name, i.index_name
+        """
+        data = self._fetch_all(query, params)
+        return AdapterResult(data=data, status="available")
+
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+        """Return the DDL of a table, view, procedure or function via DBMS_METADATA."""
+        normalized_type = object_type.strip().upper()
+        if normalized_type not in {"TABLE", "VIEW", "PROCEDURE", "FUNCTION"}:
+            return AdapterResult(
+                data=[],
+                warnings=[
+                    "Oracle DDL retrieval supports object_type 'table', 'view', "
+                    "'procedure' or 'function'."
+                ],
+                status="not_supported",
+            )
+        try:
+            data = self._fetch_all(
+                """
+                SELECT
+                    :otype_label AS object_type,
+                    :oowner AS schema,
+                    :oname AS object_name,
+                    DBMS_METADATA.GET_DDL(:otype, :oname2, :oowner2) AS ddl
+                FROM dual
+                """,
+                {
+                    "otype_label": normalized_type.lower(),
+                    "oowner": schema.upper(),
+                    "oname": object_name.upper(),
+                    "otype": normalized_type,
+                    "oname2": object_name.upper(),
+                    "oowner2": schema.upper(),
+                },
+            )
+        except DatabaseError as exc:
+            details = str(exc.details or "")
+            if "ORA-31603" in details or "ORA-31604" in details:
+                return AdapterResult(
+                    data=[],
+                    warnings=[
+                        f"No {normalized_type.lower()} "
+                        f"'{schema}.{object_name}' found."
+                    ],
+                    status="not_found",
+                )
+            raise
+        return AdapterResult(data=data, status="available")
+
+    def search_objects(
+        self,
+        schemas: tuple[str, ...],
+        pattern: str,
+        object_types: tuple[str, ...],
+    ) -> AdapterResult:
+        """Search objects by case-insensitive name substring across selected schemas."""
+        in_clause, params = self._schema_params(schemas)
+        type_map = {
+            "table": "TABLE",
+            "view": "VIEW",
+            "sequence": "SEQUENCE",
+            "procedure": "PROCEDURE",
+            "function": "FUNCTION",
+        }
+        oracle_types = [type_map[t] for t in object_types if t in type_map]
+        type_placeholders = []
+        for idx, oracle_type in enumerate(oracle_types):
+            key = f"t{idx}"
+            type_placeholders.append(f":{key}")
+            params[key] = oracle_type
+        params["pattern"] = f"%{pattern.upper()}%"
+        query = f"""
+            SELECT
+                owner AS schema,
+                object_name,
+                CASE object_type
+                    WHEN 'TABLE' THEN 'table'
+                    WHEN 'VIEW' THEN 'view'
+                    WHEN 'SEQUENCE' THEN 'sequence'
+                    WHEN 'PROCEDURE' THEN 'procedure'
+                    WHEN 'FUNCTION' THEN 'function'
+                END AS object_type
+            FROM all_objects
+            WHERE owner IN ({in_clause})
+              AND object_type IN ({", ".join(type_placeholders)})
+              AND UPPER(object_name) LIKE :pattern
+            ORDER BY owner, object_type, object_name
+        """
+        data = self._fetch_all(query, params)
+        return AdapterResult(data=data, status="available")
 
     def sample_table(
         self,

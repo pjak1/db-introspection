@@ -56,6 +56,20 @@ class DummyAdapter(DatabaseAdapter):
     ) -> AdapterResult:
         raise NotImplementedError
 
+    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        raise NotImplementedError
+
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+        raise NotImplementedError
+
+    def search_objects(
+        self,
+        schemas: tuple[str, ...],
+        pattern: str,
+        object_types: tuple[str, ...],
+    ) -> AdapterResult:
+        raise NotImplementedError
+
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         raise NotImplementedError
 

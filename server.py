@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from src.contracts import Envelope, ErrorEnvelope, error_envelope
 from src.errors import AppError
@@ -14,6 +15,22 @@ from src.services.select_service import SelectService
 
 mcp = FastMCP("db-introspection")
 connection_registry = ConnectionRegistry()
+
+# Every tool in this server is strictly read-only and never mutates the target
+# database. These hints let MCP clients and agents treat the tools accordingly.
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
+# All connection-scoped tools expect `connection` as a canonical
+# 'project/environment/schema' key. Call db_list_connections to discover the
+# available keys.
+_CONNECTION_HINT = (
+    "`connection` is a 'project/environment/schema' key from db_list_connections."
+)
 
 
 @dataclass
@@ -111,9 +128,13 @@ def _normalize_columns(columns: Any) -> list[str]:
     return []
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_connections() -> dict:
-    """List all available connection folders under the configured connections root."""
+    """List available connections as canonical 'project/environment/schema' keys.
+
+    Each returned key is the exact value to pass as the `connection` argument of
+    the other tools.
+    """
     try:
         return {
             "ok": True,
@@ -123,7 +144,7 @@ def db_list_connections() -> dict:
         return _error_envelope(err)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_tables(connection: str, schema: str, include_system: bool = False) -> Envelope:
     """List tables and views visible in the selected schema scope."""
     return _with_services(
@@ -135,7 +156,7 @@ def db_list_tables(connection: str, schema: str, include_system: bool = False) -
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_columns(connection: str, schema: str, table: str = "") -> Envelope:
     """List columns for a table in the allowed schema scope."""
     return _with_services(
@@ -144,7 +165,7 @@ def db_list_columns(connection: str, schema: str, table: str = "") -> Envelope:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_constraints(
     connection: str,
     schema: str,
@@ -162,7 +183,7 @@ def db_list_constraints(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_sequences(connection: str, schema: str) -> Envelope:
     """List sequences from schemas allowed by configuration."""
     return _with_services(
@@ -171,7 +192,7 @@ def db_list_sequences(connection: str, schema: str) -> Envelope:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_procedures(connection: str, schema: str) -> Envelope:
     """List stored procedures from schemas allowed by configuration."""
     return _with_services(
@@ -180,7 +201,7 @@ def db_list_procedures(connection: str, schema: str) -> Envelope:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_functions(connection: str, schema: str) -> Envelope:
     """List functions from schemas allowed by configuration."""
     return _with_services(
@@ -189,7 +210,7 @@ def db_list_functions(connection: str, schema: str) -> Envelope:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_list_jobs(connection: str, schema: str) -> Envelope:
     """List scheduler jobs when supported by the selected database dialect."""
     return _with_services(
@@ -198,7 +219,7 @@ def db_list_jobs(connection: str, schema: str) -> Envelope:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_sample_table(
     connection: str,
     schema: str,
@@ -218,7 +239,7 @@ def db_sample_table(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_select_columns(
     connection: str,
     schema: str,
@@ -238,7 +259,7 @@ def db_select_columns(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def db_run_select(
     connection: str,
     sql: str = "",
@@ -246,7 +267,10 @@ def db_run_select(
     timeout_ms: int | None = None,
     explain: bool = False,
 ) -> Envelope:
-    """Run a guarded read-only SELECT query or return its estimated plan."""
+    """Run a guarded read-only SELECT query or return its estimated plan.
+
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
     return _with_services(
         connection,
         lambda _, select_service: select_service.run_select(
@@ -254,6 +278,70 @@ def db_run_select(
             limit=limit,
             timeout_ms=timeout_ms,
             explain=explain,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_list_indexes(connection: str, schema: str, table: str | None = None) -> Envelope:
+    """List indexes in the allowed schema scope, optionally filtered by table.
+
+    Returns index name, uniqueness, primary-key flag, type and indexed columns.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.list_indexes(
+            schema=schema,
+            table=table,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_get_ddl(
+    connection: str,
+    schema: str,
+    object_name: str,
+    object_type: str,
+) -> Envelope:
+    """Return the DDL/source of a database object.
+
+    object_type is one of 'table', 'view', 'procedure', 'function' (table DDL is
+    only supported on Oracle; on PostgreSQL/SQL Server use db_list_columns,
+    db_list_constraints and db_list_indexes for tables).
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.get_ddl(
+            schema=schema,
+            object_name=object_name,
+            object_type=object_type,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_search_objects(
+    connection: str,
+    schema: str,
+    pattern: str,
+    object_types: Any = None,
+) -> Envelope:
+    """Find objects whose name contains a case-insensitive substring.
+
+    object_types optionally restricts the search to a subset of
+    'table', 'view', 'sequence', 'procedure', 'function' (list or CSV string);
+    defaults to all of them.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.search_objects(
+            schema=schema,
+            pattern=pattern,
+            object_types=_normalize_columns(object_types) or None,
         ),
     )
 

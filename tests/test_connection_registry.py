@@ -59,6 +59,20 @@ class DummyAdapter(DatabaseAdapter):
     ) -> AdapterResult:
         return AdapterResult(data=[])
 
+    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def search_objects(
+        self,
+        schemas: tuple[str, ...],
+        pattern: str,
+        object_types: tuple[str, ...],
+    ) -> AdapterResult:
+        return AdapterResult(data=[])
+
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         return AdapterResult(data=[])
 

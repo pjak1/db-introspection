@@ -82,6 +82,20 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
         ) -> AdapterResult:
             return AdapterResult(data=[])
 
+        def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+            return AdapterResult(data=[])
+
+        def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+            return AdapterResult(data=[])
+
+        def search_objects(
+            self,
+            schemas: tuple[str, ...],
+            pattern: str,
+            object_types: tuple[str, ...],
+        ) -> AdapterResult:
+            return AdapterResult(data=[])
+
         def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[{"dsn": self._dsn, "sql_query": sql_query}])
 
@@ -151,6 +165,20 @@ def test_adapter_class_registers_automatically():
             table: str,
             columns: list[str],
             limit: int,
+        ) -> AdapterResult:
+            return AdapterResult(data=[])
+
+        def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+            return AdapterResult(data=[])
+
+        def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+            return AdapterResult(data=[])
+
+        def search_objects(
+            self,
+            schemas: tuple[str, ...],
+            pattern: str,
+            object_types: tuple[str, ...],
         ) -> AdapterResult:
             return AdapterResult(data=[])
 

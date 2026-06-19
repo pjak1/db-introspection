@@ -57,22 +57,131 @@ class MssqlAdapter(DatabaseAdapter):
         """Wrap a query to enforce row limit in SQL Server syntax."""
         max_rows = int(limit)
         sql = query.strip().rstrip(";")
+        tail = cls._depth_zero_tail_positions(sql)
 
-        # ORDER BY inside a derived table is not valid in MSSQL unless combined with
-        # TOP/OFFSET/FOR XML. When ORDER BY is present, keep the original query as-is
-        # and append/override OFFSET-FETCH row limiting.
-        if re.search(r"\border\s+by\b", sql, re.IGNORECASE):
-            if re.search(r"\boffset\s+\d+\s+rows\b", sql, re.IGNORECASE):
-                return re.sub(
-                    r"\boffset\s+\d+\s+rows(?:\s+fetch\s+next\s+\d+\s+rows\s+only)?",
-                    f"OFFSET 0 ROWS FETCH NEXT {max_rows} ROWS ONLY",
-                    sql,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-            return f"{sql} OFFSET 0 ROWS FETCH NEXT {max_rows} ROWS ONLY"
+        # The generic derived-table wrapper (SELECT TOP (n) * FROM (...)) is invalid
+        # when the statement is a CTE (WITH cannot be nested in a derived table) or
+        # when the OUTER query already has ORDER BY/OFFSET (ORDER BY is illegal inside
+        # a derived table without its own TOP/OFFSET). In those cases limit the outer
+        # query in place via OFFSET-FETCH, which also correctly bounds UNION results.
+        # ORDER BY/OFFSET are detected only at parenthesis depth 0, so a clause inside
+        # a subquery never forces this path.
+        if cls._starts_with_cte(sql) or tail["order_by"] is not None or tail["offset"] is not None:
+            return cls._limit_outer_query(sql, max_rows, tail)
 
         return f"SELECT TOP ({max_rows}) * FROM ({sql}) mcp_subquery"
+
+    @staticmethod
+    def _starts_with_cte(sql: str) -> bool:
+        """Return True when the statement begins with a WITH (CTE) clause."""
+        return re.match(r"\s*with\b", sql, re.IGNORECASE) is not None
+
+    @staticmethod
+    def _skip_noncode_span(sql: str, i: int) -> int | None:
+        """If a literal/identifier/comment starts at `i`, return the index past it.
+
+        Returns None when the character at `i` is ordinary SQL code.
+        """
+        n = len(sql)
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if ch in "'\"":
+            i += 1
+            while i < n:
+                if sql[i] == ch and i + 1 < n and sql[i + 1] == ch:
+                    i += 2
+                    continue
+                if sql[i] == ch:
+                    return i + 1
+                i += 1
+            return i
+        if ch == "[":
+            i += 1
+            while i < n and sql[i] != "]":
+                i += 1
+            return i + 1
+        if ch == "-" and nxt == "-":
+            i += 2
+            while i < n and sql[i] != "\n":
+                i += 1
+            return i
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i < n - 1 and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            return i + 2
+        return None
+
+    @staticmethod
+    def _read_word(sql: str, i: int) -> tuple[str, int]:
+        """Read an identifier/keyword word at `i`, returning (lowercased, end)."""
+        n = len(sql)
+        j = i
+        while j < n and (sql[j].isalnum() or sql[j] in "_$"):
+            j += 1
+        return sql[i:j].lower(), j
+
+    @classmethod
+    def _depth_zero_tail_positions(cls, sql: str) -> dict[str, int | None]:
+        """Locate the outer-query ORDER BY / OFFSET at parenthesis depth 0.
+
+        Literals, quoted/bracketed identifiers and comments are skipped so that
+        an ORDER BY/OFFSET inside a CTE body or subquery is not mistaken for the
+        outer query's clause.
+        """
+        i, n, depth = 0, len(sql), 0
+        order_by_pos: int | None = None
+        offset_pos: int | None = None
+        while i < n:
+            skipped = cls._skip_noncode_span(sql, i)
+            if skipped is not None:
+                i = skipped
+                continue
+            ch = sql[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif depth == 0 and (ch.isalpha() or ch == "_"):
+                word, end = cls._read_word(sql, i)
+                if word == "offset":
+                    offset_pos = i
+                elif word == "order":
+                    k = end
+                    while k < n and sql[k].isspace():
+                        k += 1
+                    next_word, _ = cls._read_word(sql, k)
+                    if next_word == "by":
+                        order_by_pos = i
+                i = end
+                continue
+            i += 1
+        return {"order_by": order_by_pos, "offset": offset_pos}
+
+    @classmethod
+    def _limit_outer_query(
+        cls,
+        sql: str,
+        max_rows: int,
+        tail: dict[str, int | None] | None = None,
+    ) -> str:
+        """Apply an OFFSET-FETCH row limit to the outer query in place.
+
+        Used for CTEs and for any query whose outer block already has ORDER BY or
+        OFFSET, where the generic derived-table wrapper would produce invalid T-SQL.
+        """
+        if tail is None:
+            tail = cls._depth_zero_tail_positions(sql)
+        fetch = f"OFFSET 0 ROWS FETCH NEXT {max_rows} ROWS ONLY"
+        if tail["offset"] is not None:
+            # Override the outer query's existing OFFSET/FETCH window.
+            head = sql[: tail["offset"]].rstrip()
+            return f"{head} {fetch}"
+        if tail["order_by"] is not None:
+            # OFFSET-FETCH is valid because the outer query already orders rows.
+            return f"{sql} {fetch}"
+        # OFFSET-FETCH requires ORDER BY; add a no-op ordering for an unordered query.
+        return f"{sql} ORDER BY (SELECT NULL) {fetch}"
 
     def _connect(self) -> Any:
         """Create and return an ODBC connection, translating driver errors."""
@@ -180,16 +289,24 @@ class MssqlAdapter(DatabaseAdapter):
         in_clause, params = self._in_clause(schemas)
         query = f"""
             SELECT
-                TABLE_SCHEMA AS [schema],
-                TABLE_NAME AS table_name,
-                TABLE_TYPE AS table_type
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA IN ({in_clause})
+                t.TABLE_SCHEMA AS [schema],
+                t.TABLE_NAME AS table_name,
+                t.TABLE_TYPE AS table_type,
+                CAST((
+                    SELECT ep.value
+                    FROM sys.extended_properties ep
+                    WHERE ep.major_id = OBJECT_ID(
+                            QUOTENAME(t.TABLE_SCHEMA) + '.' + QUOTENAME(t.TABLE_NAME))
+                      AND ep.minor_id = 0
+                      AND ep.name = 'MS_Description'
+                ) AS nvarchar(max)) AS table_comment
+            FROM INFORMATION_SCHEMA.TABLES t
+            WHERE t.TABLE_SCHEMA IN ({in_clause})
               AND (
                     ? = 1
-                    OR TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+                    OR t.TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
               )
-            ORDER BY TABLE_SCHEMA, TABLE_NAME
+            ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME
         """
         data = self._fetch_all(query, params + (1 if include_system else 0,))
         return AdapterResult(data=data)
@@ -199,22 +316,32 @@ class MssqlAdapter(DatabaseAdapter):
         in_clause, params = self._in_clause(schemas)
         query = f"""
             SELECT
-                TABLE_SCHEMA AS [schema],
-                TABLE_NAME AS table_name,
-                COLUMN_NAME AS column_name,
-                ORDINAL_POSITION AS ordinal_position,
-                DATA_TYPE AS data_type,
-                DATA_TYPE AS udt_name,
-                CASE IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END AS is_nullable,
-                COLUMN_DEFAULT AS column_default,
-                CHARACTER_MAXIMUM_LENGTH AS _character_maximum_length,
-                NUMERIC_PRECISION AS _numeric_precision,
-                NUMERIC_SCALE AS _numeric_scale,
-                DATETIME_PRECISION AS _datetime_precision
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME = ?
-              AND TABLE_SCHEMA IN ({in_clause})
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+                c.TABLE_SCHEMA AS [schema],
+                c.TABLE_NAME AS table_name,
+                c.COLUMN_NAME AS column_name,
+                c.ORDINAL_POSITION AS ordinal_position,
+                c.DATA_TYPE AS data_type,
+                c.DATA_TYPE AS udt_name,
+                CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END AS is_nullable,
+                c.COLUMN_DEFAULT AS column_default,
+                CAST((
+                    SELECT ep.value
+                    FROM sys.extended_properties ep
+                    WHERE ep.major_id = OBJECT_ID(
+                            QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))
+                      AND ep.minor_id = COLUMNPROPERTY(
+                            OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)),
+                            c.COLUMN_NAME, 'ColumnId')
+                      AND ep.name = 'MS_Description'
+                ) AS nvarchar(max)) AS comment,
+                c.CHARACTER_MAXIMUM_LENGTH AS _character_maximum_length,
+                c.NUMERIC_PRECISION AS _numeric_precision,
+                c.NUMERIC_SCALE AS _numeric_scale,
+                c.DATETIME_PRECISION AS _datetime_precision
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            WHERE c.TABLE_NAME = ?
+              AND c.TABLE_SCHEMA IN ({in_clause})
+            ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
         """
         data = self._with_full_data_type(self._fetch_all(query, (table,) + params))
         return AdapterResult(data=data)
@@ -352,6 +479,107 @@ class MssqlAdapter(DatabaseAdapter):
                     status="not_available",
                 )
             raise
+
+    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List indexes for selected schemas, optionally filtered by table."""
+        in_clause, params = self._in_clause(schemas)
+        query = f"""
+            SELECT
+                SCHEMA_NAME(t.schema_id) AS [schema],
+                t.name AS table_name,
+                ix.name AS index_name,
+                ix.is_unique,
+                ix.is_primary_key AS is_primary,
+                ix.type_desc AS index_type,
+                STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns
+            FROM sys.indexes ix
+            JOIN sys.tables t ON t.object_id = ix.object_id
+            JOIN sys.index_columns ic
+              ON ic.object_id = ix.object_id AND ic.index_id = ix.index_id
+            JOIN sys.columns c
+              ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ix.type > 0
+              AND SCHEMA_NAME(t.schema_id) IN ({in_clause})
+              AND (? IS NULL OR t.name = ?)
+            GROUP BY SCHEMA_NAME(t.schema_id), t.name, ix.name,
+                     ix.is_unique, ix.is_primary_key, ix.type_desc
+            ORDER BY [schema], table_name, index_name
+        """
+        normalized_table = table.strip() if isinstance(table, str) else None
+        bind = params + (normalized_table, normalized_table)
+        data = self._fetch_all(query, bind)
+        return AdapterResult(data=data, status="available")
+
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
+        """Return the module definition of a view, procedure or function."""
+        normalized_type = object_type.strip().lower()
+        if normalized_type not in {"view", "procedure", "function"}:
+            return AdapterResult(
+                data=[],
+                warnings=[
+                    "SQL Server DDL retrieval supports object_type 'view', 'procedure' or "
+                    "'function'. For tables use db_list_columns, db_list_constraints and "
+                    "db_list_indexes."
+                ],
+                status="not_supported",
+            )
+        query = """
+            SELECT
+                ? AS object_type,
+                ? AS [schema],
+                ? AS object_name,
+                OBJECT_DEFINITION(OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?))) AS ddl
+        """
+        data = self._fetch_all(
+            query,
+            (normalized_type, schema, object_name, schema, object_name),
+        )
+        if not data or data[0].get("ddl") is None:
+            return AdapterResult(
+                data=[],
+                warnings=[f"No {normalized_type} '{schema}.{object_name}' found."],
+                status="not_found",
+            )
+        return AdapterResult(data=data, status="available")
+
+    def search_objects(
+        self,
+        schemas: tuple[str, ...],
+        pattern: str,
+        object_types: tuple[str, ...],
+    ) -> AdapterResult:
+        """Search objects by case-insensitive name substring across selected schemas."""
+        in1, p1 = self._in_clause(schemas)
+        in2, p2 = self._in_clause(schemas)
+        in3, p3 = self._in_clause(schemas)
+        in4, p4 = self._in_clause(schemas)
+        types_in = ", ".join("?" for _ in object_types)
+        query = f"""
+            SELECT o.[schema], o.object_name, o.object_type
+            FROM (
+                SELECT TABLE_SCHEMA AS [schema], TABLE_NAME AS object_name,
+                       CASE WHEN TABLE_TYPE = 'VIEW' THEN 'view' ELSE 'table' END AS object_type
+                FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA IN ({in1})
+                UNION ALL
+                SELECT SCHEMA_NAME(schema_id), name, 'sequence'
+                FROM sys.sequences WHERE SCHEMA_NAME(schema_id) IN ({in2})
+                UNION ALL
+                SELECT SCHEMA_NAME(schema_id), name, 'procedure'
+                FROM sys.procedures WHERE SCHEMA_NAME(schema_id) IN ({in3})
+                UNION ALL
+                SELECT SCHEMA_NAME(schema_id), name, 'function'
+                FROM sys.objects
+                WHERE type IN ('FN', 'IF', 'TF', 'FS', 'FT')
+                  AND SCHEMA_NAME(schema_id) IN ({in4})
+            ) o
+            WHERE LOWER(o.object_name) LIKE LOWER(?)
+              AND o.object_type IN ({types_in})
+            ORDER BY o.[schema], o.object_type, o.object_name
+        """
+        like = f"%{pattern}%"
+        bind = p1 + p2 + p3 + p4 + (like,) + tuple(object_types)
+        data = self._fetch_all(query, bind)
+        return AdapterResult(data=data, status="available")
 
     def sample_table(
         self,
