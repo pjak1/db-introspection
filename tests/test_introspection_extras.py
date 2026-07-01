@@ -182,6 +182,15 @@ def test_postgres_list_tables_includes_comment():
     assert "AS table_comment" in captured["query"]
 
 
+def test_oracle_list_columns_quotes_reserved_comment_alias():
+    # COMMENT is a reserved word in Oracle; an unquoted alias raises ORA-00923.
+    adapter = OracleAdapter("user/pass@db")
+    captured = _capture(adapter)
+    adapter.list_columns(table="users", schemas=("sample_schema",))
+    assert 'AS "comment"' in captured["query"]
+    assert "AS comment," not in captured["query"]
+
+
 # --------------------------------------------------------------------------
 # Service-level validation and not_supported degradation
 # --------------------------------------------------------------------------

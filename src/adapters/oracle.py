@@ -213,7 +213,7 @@ class OracleAdapter(DatabaseAdapter):
                 (SELECT comments FROM all_col_comments cc
                   WHERE cc.owner = all_tab_columns.owner
                     AND cc.table_name = all_tab_columns.table_name
-                    AND cc.column_name = all_tab_columns.column_name) AS comment,
+                    AND cc.column_name = all_tab_columns.column_name) AS "comment",
                 char_used AS helper_char_used,
                 char_length AS helper_char_length,
                 data_length AS helper_data_length,
