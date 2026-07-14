@@ -11,7 +11,7 @@ from src.adapters.factory import create_adapter
 from src.config import Settings
 from src.contracts import Envelope, error_envelope, success_envelope
 from src.errors import DatabaseError, ValidationError
-from src.services._response_helpers import (
+from src.services.response import (
     Ok,
     elapsed_ms,
     error_from_exception,

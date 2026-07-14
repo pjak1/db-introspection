@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from src.contracts import Envelope, ErrorEnvelope, success_envelope
-from src.services._response_helpers import elapsed_ms, envelope_for_error
+from src.services.response import elapsed_ms, envelope_for_error
 from src.services.connection_registry import ConnectionRegistry
 from src.services.introspection_service import IntrospectionService
 from src.services.select_service import SelectService

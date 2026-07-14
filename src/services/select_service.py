@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from src.adapters.base import DatabaseAdapter
 from src.config import Settings
-from src.services._response_helpers import Ok, service_operation
+from src.services.response import Ok, service_operation
 from src.services.query_guard import QueryGuard
 
 

@@ -5,9 +5,10 @@ import re
 from src.adapters.base import DatabaseAdapter
 from src.config import Settings
 from src.errors import DatabaseError, ValidationError
-from src.services._response_helpers import Ok, service_operation
+from src.services.response import Ok, service_operation
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_EMPTY_TABLE_MESSAGE = "Table name cannot be empty."
 
 
 class IntrospectionService:
@@ -61,7 +62,7 @@ class IntrospectionService:
     def list_columns(self, table: str, schema: str) -> Ok:
         """List columns for a table constrained to allowed schemas."""
         if not table.strip():
-            raise ValidationError("invalid_table", "Table name cannot be empty.")
+            raise ValidationError("invalid_table", _EMPTY_TABLE_MESSAGE)
         schema_used = self._require_schema(schema)
         result = self._adapter.list_columns(table=table, schemas=(schema_used,))
         return Ok(result, schema_used=schema_used)
@@ -193,7 +194,7 @@ class IntrospectionService:
     ) -> Ok:
         """Return a bounded row sample from one table."""
         if not table.strip():
-            raise ValidationError("invalid_table", "Table name cannot be empty.")
+            raise ValidationError("invalid_table", _EMPTY_TABLE_MESSAGE)
         schema_used = self._require_schema(schema)
         applied_limit, truncated, warnings = self._resolve_sample_limit(limit)
         result = self._adapter.sample_table(
@@ -214,7 +215,7 @@ class IntrospectionService:
     ) -> Ok:
         """Return a bounded row sample projected to requested columns."""
         if not table.strip():
-            raise ValidationError("invalid_table", "Table name cannot be empty.")
+            raise ValidationError("invalid_table", _EMPTY_TABLE_MESSAGE)
         if not columns:
             raise ValidationError("invalid_columns", "At least one column must be provided.")
 
