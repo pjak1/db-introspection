@@ -1,96 +1,20 @@
-﻿from src.adapters.base import AdapterResult, DatabaseAdapter
-from src.config import Settings
+from conftest import BaseStubAdapter, make_settings
+
+from src.adapters.base import AdapterResult
 from src.services.introspection_service import IntrospectionService
 
 
-class DummyAdapter(DatabaseAdapter):
+class DummyAdapter(BaseStubAdapter):
     def __init__(self, dialect: str, jobs_data: list[dict]):
         self._dialect = dialect
         self._jobs_data = jobs_data
 
-    @property
-    def dialect(self) -> str:
-        return self._dialect
-
-    def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_columns(self, table: str, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_constraints(
-        self,
-        schemas: tuple[str, ...],
-        table: str | None = None,
-        constraint_type: str | None = None,
-    ) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_sequences(self, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_procedures(self, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_functions(self, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
     def list_jobs(self) -> AdapterResult:
         return AdapterResult(data=self._jobs_data, status="available")
 
-    def sample_table(
-        self,
-        schema: str,
-        table: str,
-        limit: int,
-        order_by: str | None,
-    ) -> AdapterResult:
-        raise NotImplementedError
 
-    def select_columns(
-        self,
-        schema: str,
-        table: str,
-        columns: list[str],
-        limit: int,
-    ) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-        raise NotImplementedError
-
-    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
-        raise NotImplementedError
-
-    def search_objects(
-        self,
-        schemas: tuple[str, ...],
-        pattern: str,
-        object_types: tuple[str, ...],
-    ) -> AdapterResult:
-        raise NotImplementedError
-
-    def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
-        raise NotImplementedError
-
-    def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
-        raise NotImplementedError
-
-    def open_connection(self):
-        raise NotImplementedError
-
-
-def _settings(*, db_dialect: str, allowed_schemas: tuple[str, ...]) -> Settings:
-    return Settings(
-        db_dialect=db_dialect,
-        db_dsn="db://test",
-        allowed_schemas=allowed_schemas,
-        default_sample_limit=10,
-        max_sample_limit=100,
-        max_select_limit=200,
-        statement_timeout_ms=5000,
-        include_system_schemas=False,
-    )
+def _settings(*, db_dialect: str, allowed_schemas: tuple[str, ...]):
+    return make_settings(db_dialect=db_dialect, db_dsn="db://test", allowed_schemas=allowed_schemas)
 
 
 def test_list_jobs_oracle_validates_schema_param():
@@ -100,8 +24,7 @@ def test_list_jobs_oracle_validates_schema_param():
     ]
     service = IntrospectionService(
         adapter=DummyAdapter(dialect="oracle", jobs_data=jobs),
-        settings=_settings(db_dialect="oracle",
-                           allowed_schemas=("sample_schema",)),
+        settings=_settings(db_dialect="oracle", allowed_schemas=("sample_schema",)),
     )
     result = service.list_jobs(schema="sample_schema")
     assert result["ok"] is True
@@ -112,8 +35,7 @@ def test_list_jobs_oracle_validates_schema_param():
 def test_list_jobs_oracle_rejects_non_allowed_schema():
     service = IntrospectionService(
         adapter=DummyAdapter(dialect="oracle", jobs_data=[{"job_name": "A"}]),
-        settings=_settings(db_dialect="oracle",
-                           allowed_schemas=("sample_schema",)),
+        settings=_settings(db_dialect="oracle", allowed_schemas=("sample_schema",)),
     )
     result = service.list_jobs(schema="secret")
     assert result["ok"] is False

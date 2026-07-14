@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from src.contracts import Envelope, ErrorEnvelope, error_envelope
-from src.errors import AppError
+from src.contracts import Envelope, ErrorEnvelope, success_envelope
+from src.services._response_helpers import elapsed_ms, envelope_for_error
 from src.services.connection_registry import ConnectionRegistry
 from src.services.introspection_service import IntrospectionService
 from src.services.select_service import SelectService
@@ -33,60 +33,13 @@ _CONNECTION_HINT = (
 )
 
 
-@dataclass
-class ServiceResolution:
-    """Resolved services or an error envelope when resolution fails."""
-    introspection_service: IntrospectionService | None = None
-    select_service: SelectService | None = None
-    error: ErrorEnvelope | None = None
-
-    @property
-    def is_error(self) -> bool:
-        return self.error is not None
-
-    @classmethod
-    def success(
-        cls,
-        introspection_service: IntrospectionService,
-        select_service: SelectService,
-    ) -> "ServiceResolution":
-        return cls(
-            introspection_service=introspection_service,
-            select_service=select_service,
-            error=None,
-        )
-
-    @classmethod
-    def failure(cls, error: ErrorEnvelope) -> "ServiceResolution":
-        return cls(error=error)
-
-
 def _error_envelope(err: Exception) -> ErrorEnvelope:
-    """Convert any exception into the public MCP error envelope format."""
-    if isinstance(err, AppError):
-        return error_envelope(
-            dialect="unknown",
-            code=err.code,
-            message=err.message,
-            duration_ms=0,
-            details=err.details,
-        )
-    return error_envelope(
-        dialect="unknown",
-        code="internal_error",
-        message="Unexpected internal error.",
-        duration_ms=0,
-        details=str(err),
-    )
+    """Convert an exception into the public MCP error envelope (untimed).
 
-
-def _services_for(connection: str) -> ServiceResolution:
-    """Resolve services for a connection, returning an error envelope on failure."""
-    try:
-        introspection_service, select_service = connection_registry.get_services(connection=connection)
-        return ServiceResolution.success(introspection_service, select_service)
-    except Exception as err:  # noqa: BLE001
-        return ServiceResolution.failure(_error_envelope(err))
+    Connection resolution happens before any dialect is known, so this reuses the
+    shared error mapping with dialect 'unknown' and a zero duration.
+    """
+    return envelope_for_error("unknown", 0, err)
 
 
 def _with_services(
@@ -94,27 +47,12 @@ def _with_services(
     handler: Callable[[IntrospectionService, SelectService], Envelope],
 ) -> Envelope:
     """Run a handler with resolved services or return a prepared error response."""
-    resolution = _services_for(connection=connection)
-    if resolution.is_error:
-        if resolution.error is None:
-            return error_envelope(
-                dialect="unknown",
-                code="internal_error",
-                message="Unexpected internal error.",
-                duration_ms=0,
-                details="Service resolution flagged an error without payload.",
-            )
-        return resolution.error
-
-    if resolution.introspection_service is None or resolution.select_service is None:
-        return error_envelope(
-            dialect="unknown",
-            code="internal_error",
-            message="Unexpected internal error.",
-            duration_ms=0,
-            details="Service resolution returned incomplete state.",
-        )
-    return handler(resolution.introspection_service, resolution.select_service)
+    try:
+        introspection_service, select_service = connection_registry.get_services(
+            connection=connection)
+    except Exception as err:  # noqa: BLE001
+        return _error_envelope(err)
+    return handler(introspection_service, select_service)
 
 
 def _normalize_columns(columns: Any) -> list[str]:
@@ -129,17 +67,19 @@ def _normalize_columns(columns: Any) -> list[str]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def db_list_connections() -> dict:
+def db_list_connections() -> Envelope:
     """List available connections as canonical 'project/environment/schema' keys.
 
-    Each returned key is the exact value to pass as the `connection` argument of
+    Each item in `data` is the exact value to pass as the `connection` argument of
     the other tools.
     """
+    started = time.perf_counter()
     try:
-        return {
-            "ok": True,
-            "connections": connection_registry.list_connections(),
-        }
+        return success_envelope(
+            dialect="unknown",
+            data=connection_registry.list_connections(),
+            duration_ms=elapsed_ms(started),
+        )
     except Exception as err:  # noqa: BLE001
         return _error_envelope(err)
 

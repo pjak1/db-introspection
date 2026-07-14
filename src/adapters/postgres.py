@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from urllib.parse import quote_plus
 from typing import Any
 
@@ -8,18 +7,18 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from src.adapters._sql_helpers import ORDER_BY_RE, degraded_or_raise
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.adapters.normalization import normalize_rows
 from src.errors import DatabaseError, ValidationError
-
-_ORDER_BY_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(asc|desc))?\s*$", re.IGNORECASE)
 
 
 class PostgresAdapter(DatabaseAdapter):
     """PostgreSQL implementation of the generic database adapter contract."""
     dialect_name = "postgres"
     dsn_env_var = "POSTGRES_DSN"
+    # Table DDL is not reconstructed on PostgreSQL; use db_list_columns/constraints/indexes.
+    ddl_object_types = ("view", "procedure", "function")
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use PostgreSQL DSN."""
@@ -283,17 +282,18 @@ class PostgresAdapter(DatabaseAdapter):
             data = self._fetch_all("SELECT * FROM cron.job ORDER BY jobid")
             return AdapterResult(data=data, status="available")
         except DatabaseError as exc:
-            details = str(exc.details or "")
-            details_lower = details.lower()
-            if (
+            details_lower = str(exc.details or "").lower()
+            cron_unavailable = (
                 "relation \"cron.job\" does not exist" in details_lower
                 or "schema \"cron\" does not exist" in details_lower
                 or "permission denied for schema cron" in details_lower
                 or "permission denied for table job" in details_lower
-            ):
-                warning = "PostgreSQL cron catalog (pg_cron) is not available for this database/user."
-                return AdapterResult(data=[], warnings=[warning], status="not_available")
-            raise
+            )
+            return degraded_or_raise(
+                exc,
+                matched=cron_unavailable,
+                warning="PostgreSQL cron catalog (pg_cron) is not available for this database/user.",
+            )
 
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
         """List indexes for selected schemas, optionally filtered by table."""
@@ -422,7 +422,7 @@ class PostgresAdapter(DatabaseAdapter):
         params: list[Any] = [limit]
 
         if order_by:
-            match = _ORDER_BY_RE.match(order_by)
+            match = ORDER_BY_RE.match(order_by)
             if not match:
                 raise ValidationError(
                     "invalid_order_by",

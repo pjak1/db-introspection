@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections.abc import Generator
 from uuid import uuid4
 
 import pytest
+from conftest import BaseStubAdapter
 
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.adapters.factory import create_adapter
@@ -15,7 +16,7 @@ from src.services.query_guard import QueryGuard
 def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None]:
     dialect = f"testdb_{uuid4().hex}"
 
-    class DynamicAdapter(DatabaseAdapter):
+    class DynamicAdapter(BaseStubAdapter):
         dialect_name = None
         dsn_env_var = "TESTDB_DSN"
 
@@ -38,72 +39,11 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
         def wrap_select(cls, query: str, limit: int) -> str:
             return f"SELECT * FROM ({query}) AS dyn LIMIT {int(limit)}"
 
-        def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_columns(self, table: str, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_constraints(
-            self,
-            schemas: tuple[str, ...],
-            table: str | None = None,
-            constraint_type: str | None = None,
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_sequences(self, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_procedures(self, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_functions(self, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_jobs(self) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def sample_table(
-            self,
-            schema: str,
-            table: str,
-            limit: int,
-            order_by: str | None,
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def select_columns(
-            self,
-            schema: str,
-            table: str,
-            columns: list[str],
-            limit: int,
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def search_objects(
-            self,
-            schemas: tuple[str, ...],
-            pattern: str,
-            object_types: tuple[str, ...],
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
         def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[{"dsn": self._dsn, "sql_query": sql_query}])
 
         def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[{"plan_text": sql_query}], status="explain")
-
-        def open_connection(self):
-            raise NotImplementedError
 
     DynamicAdapter.dialect_name = dialect
     DatabaseAdapter._registry[dialect] = DynamicAdapter
@@ -117,7 +57,7 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
 def test_adapter_class_registers_automatically():
     dialect = "auto_registry_testdb"
 
-    class AutoAdapter(DatabaseAdapter):
+    class AutoAdapter(BaseStubAdapter):
         dialect_name = "auto_registry_testdb"
 
         def __init__(self, dsn: str):
@@ -126,73 +66,6 @@ def test_adapter_class_registers_automatically():
         @property
         def dialect(self) -> str:
             return self.dialect_name
-
-        def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_columns(self, table: str, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_constraints(
-            self,
-            schemas: tuple[str, ...],
-            table: str | None = None,
-            constraint_type: str | None = None,
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_sequences(self, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_procedures(self, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_functions(self, schemas: tuple[str, ...]) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_jobs(self) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def sample_table(
-            self,
-            schema: str,
-            table: str,
-            limit: int,
-            order_by: str | None,
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def select_columns(
-            self,
-            schema: str,
-            table: str,
-            columns: list[str],
-            limit: int,
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def search_objects(
-            self,
-            schemas: tuple[str, ...],
-            pattern: str,
-            object_types: tuple[str, ...],
-        ) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
-            return AdapterResult(data=[])
-
-        def open_connection(self):
-            raise NotImplementedError
 
     try:
         assert DatabaseAdapter.adapter_class_for(dialect) is AutoAdapter

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import pytest
+from conftest import BaseStubAdapter, make_settings
 
-from src.adapters.base import AdapterResult, DatabaseAdapter
+from src.adapters.base import AdapterResult
 from src.adapters.mssql import MssqlAdapter
 from src.adapters.oracle import OracleAdapter
 from src.adapters.postgres import PostgresAdapter
-from src.config import Settings
 from src.services.introspection_service import IntrospectionService
 
 
@@ -195,48 +195,11 @@ def test_oracle_list_columns_quotes_reserved_comment_alias():
 # Service-level validation and not_supported degradation
 # --------------------------------------------------------------------------
 
-class _StubAdapter(DatabaseAdapter):
+class _StubAdapter(BaseStubAdapter):
     """Minimal adapter recording calls; inherits base not_supported defaults."""
 
     def __init__(self):
         self.calls: dict = {}
-
-    @property
-    def dialect(self) -> str:
-        return "postgres"
-
-    def list_tables(self, schemas, include_system):
-        return AdapterResult(data=[])
-
-    def list_columns(self, table, schemas):
-        return AdapterResult(data=[])
-
-    def list_constraints(self, schemas, table=None, constraint_type=None):
-        return AdapterResult(data=[])
-
-    def list_sequences(self, schemas):
-        return AdapterResult(data=[])
-
-    def list_procedures(self, schemas):
-        return AdapterResult(data=[])
-
-    def list_functions(self, schemas):
-        return AdapterResult(data=[])
-
-    def list_jobs(self):
-        return AdapterResult(data=[])
-
-    def sample_table(self, schema, table, limit, order_by):
-        return AdapterResult(data=[])
-
-    def select_columns(self, schema, table, columns, limit):
-        return AdapterResult(data=[])
-
-    def run_select(self, sql_query, timeout_ms):
-        return AdapterResult(data=[])
-
-    def explain_select(self, sql_query, timeout_ms):
-        return AdapterResult(data=[])
 
     def list_indexes(self, schemas, table=None):
         self.calls["list_indexes"] = {"schemas": schemas, "table": table}
@@ -252,26 +215,10 @@ class _StubAdapter(DatabaseAdapter):
             "schemas": schemas, "pattern": pattern, "object_types": object_types}
         return AdapterResult(data=[], status="available")
 
-    def open_connection(self):
-        raise NotImplementedError
-
-
-def _settings() -> Settings:
-    return Settings(
-        db_dialect="postgres",
-        db_dsn="postgresql://u:p@localhost:5432/db",
-        allowed_schemas=("public",),
-        default_sample_limit=10,
-        max_sample_limit=100,
-        max_select_limit=200,
-        statement_timeout_ms=5000,
-        include_system_schemas=False,
-    )
-
 
 def _service(adapter=None) -> tuple[IntrospectionService, _StubAdapter]:
     adapter = adapter or _StubAdapter()
-    return IntrospectionService(adapter=adapter, settings=_settings()), adapter
+    return IntrospectionService(adapter=adapter, settings=make_settings()), adapter
 
 
 def test_service_list_indexes_normalizes_blank_table_to_none():
@@ -339,3 +286,39 @@ def test_service_search_objects_dedupes_requested_types():
     service.search_objects(
         schema="public", pattern="a", object_types=["table", "Table", "TABLE"])
     assert adapter.calls["search_objects"]["object_types"] == ("table",)
+
+
+# --------------------------------------------------------------------------
+# #1 additive output-shape consistency
+# --------------------------------------------------------------------------
+
+def test_oracle_list_sequences_exposes_start_value_key():
+    adapter = OracleAdapter(dsn="u/p@db")
+    captured = _capture(adapter)
+    adapter.list_sequences(schemas=("SCHEMA",))
+    assert "start_value" in captured["query"].lower()
+
+
+def test_oracle_list_constraints_returns_real_check_clause():
+    adapter = OracleAdapter(dsn="u/p@db")
+    captured = _capture(adapter)
+    adapter.list_constraints(schemas=("SCHEMA",))
+    assert "search_condition_vc as check_clause" in captured["query"].lower()
+
+
+def test_ddl_object_types_are_dialect_accurate():
+    # The advertised DDL object types must match what each dialect really supports:
+    # only Oracle reconstructs table DDL.
+    assert "table" in OracleAdapter.ddl_object_types
+    assert "table" not in PostgresAdapter.ddl_object_types
+    assert "table" not in MssqlAdapter.ddl_object_types
+
+
+def test_get_ddl_table_rejected_when_dialect_excludes_it():
+    class _PgStub(BaseStubAdapter):
+        ddl_object_types = ("view", "procedure", "function")
+
+    service = IntrospectionService(adapter=_PgStub(), settings=make_settings())
+    result = service.get_ddl(schema="public", object_name="t", object_type="table")
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid_object_type"

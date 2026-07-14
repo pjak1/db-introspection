@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import re
-import time
 
 from src.adapters.base import DatabaseAdapter
 from src.config import Settings
-from src.contracts import Envelope, success_envelope
 from src.errors import DatabaseError, ValidationError
-from src.services._response_helpers import elapsed_ms, error_from_exception
+from src.services._response_helpers import Ok, service_operation
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
@@ -52,123 +50,67 @@ class IntrospectionService:
             )
         return applied, truncated, warnings
 
-    def list_tables(self, schema: str, include_system: bool) -> Envelope:
+    @service_operation
+    def list_tables(self, schema: str, include_system: bool) -> Ok:
         """List tables/views for the effective schema scope."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            result = self._adapter.list_tables(
-                schemas=(schema_used,), include_system=include_system)
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                truncated=result.truncated,
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        result = self._adapter.list_tables(schemas=(schema_used,), include_system=include_system)
+        return Ok(result, schema_used=schema_used)
 
-    def list_columns(self, table: str, schema: str) -> Envelope:
+    @service_operation
+    def list_columns(self, table: str, schema: str) -> Ok:
         """List columns for a table constrained to allowed schemas."""
-        started = time.perf_counter()
-        try:
-            if not table.strip():
-                raise ValidationError(
-                    "invalid_table", "Table name cannot be empty.")
-            schema_used = self._require_schema(schema)
-            result = self._adapter.list_columns(
-                table=table, schemas=(schema_used,))
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        if not table.strip():
+            raise ValidationError("invalid_table", "Table name cannot be empty.")
+        schema_used = self._require_schema(schema)
+        result = self._adapter.list_columns(table=table, schemas=(schema_used,))
+        return Ok(result, schema_used=schema_used)
 
+    @service_operation
     def list_constraints(
         self,
         schema: str,
         table: str | None,
         constraint_type: str | None,
-    ) -> Envelope:
+    ) -> Ok:
         """List constraints with optional schema/table/type filters."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            result = self._adapter.list_constraints(
-                schemas=(schema_used,),
-                table=table,
-                constraint_type=constraint_type,
-            )
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        result = self._adapter.list_constraints(
+            schemas=(schema_used,),
+            table=table,
+            constraint_type=constraint_type,
+        )
+        return Ok(result, schema_used=schema_used)
 
-    def list_indexes(self, schema: str, table: str | None) -> Envelope:
+    @service_operation
+    def list_indexes(self, schema: str, table: str | None) -> Ok:
         """List indexes for the effective schema scope, optionally filtered by table."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            normalized_table = table.strip() if isinstance(table, str) and table.strip() else None
-            result = self._adapter.list_indexes(
-                schemas=(schema_used,), table=normalized_table)
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        normalized_table = table.strip() if isinstance(table, str) and table.strip() else None
+        result = self._adapter.list_indexes(schemas=(schema_used,), table=normalized_table)
+        return Ok(result, schema_used=schema_used)
 
-    def get_ddl(self, schema: str, object_name: str, object_type: str) -> Envelope:
+    @service_operation
+    def get_ddl(self, schema: str, object_name: str, object_type: str) -> Ok:
         """Return the DDL of a database object within the allowed schema scope."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            normalized_name = object_name.strip() if isinstance(object_name, str) else ""
-            if not normalized_name:
-                raise ValidationError(
-                    "invalid_object_name", "object_name cannot be empty.")
-            normalized_type = object_type.strip().lower() if isinstance(object_type, str) else ""
-            allowed_types = self._adapter.ddl_object_types
-            if normalized_type not in allowed_types:
-                raise ValidationError(
-                    "invalid_object_type",
-                    f"object_type must be one of: {', '.join(allowed_types)}.",
-                    details={"allowed_object_types": list(allowed_types)},
-                )
-            result = self._adapter.get_ddl(
-                schema=schema_used,
-                object_name=normalized_name,
-                object_type=normalized_type,
+        schema_used = self._require_schema(schema)
+        normalized_name = object_name.strip() if isinstance(object_name, str) else ""
+        if not normalized_name:
+            raise ValidationError("invalid_object_name", "object_name cannot be empty.")
+        normalized_type = object_type.strip().lower() if isinstance(object_type, str) else ""
+        allowed_types = self._adapter.ddl_object_types
+        if normalized_type not in allowed_types:
+            raise ValidationError(
+                "invalid_object_type",
+                f"object_type must be one of: {', '.join(allowed_types)}.",
+                details={"allowed_object_types": list(allowed_types)},
             )
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        result = self._adapter.get_ddl(
+            schema=schema_used,
+            object_name=normalized_name,
+            object_type=normalized_type,
+        )
+        return Ok(result, schema_used=schema_used)
 
     def _normalize_object_types(self, object_types: list[str] | None) -> tuple[str, ...]:
         """Validate requested search object types against adapter-supported types."""
@@ -178,8 +120,7 @@ class IntrospectionService:
         requested: list[str] = []
         for item in object_types:
             if not isinstance(item, str):
-                raise ValidationError(
-                    "invalid_object_type", "object_types must be strings.")
+                raise ValidationError("invalid_object_type", "object_types must be strings.")
             normalized = item.strip().lower()
             if normalized not in supported:
                 raise ValidationError(
@@ -191,199 +132,114 @@ class IntrospectionService:
                 requested.append(normalized)
         return tuple(requested)
 
+    @service_operation
     def search_objects(
         self,
         schema: str,
         pattern: str,
         object_types: list[str] | None,
-    ) -> Envelope:
+    ) -> Ok:
         """Search objects by name substring within the allowed schema scope."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            normalized_pattern = pattern.strip() if isinstance(pattern, str) else ""
-            if not normalized_pattern:
-                raise ValidationError(
-                    "invalid_pattern", "Search pattern cannot be empty.")
+        schema_used = self._require_schema(schema)
+        normalized_pattern = pattern.strip() if isinstance(pattern, str) else ""
+        if not normalized_pattern:
+            raise ValidationError("invalid_pattern", "Search pattern cannot be empty.")
+        effective_types = self._normalize_object_types(object_types)
+        result = self._adapter.search_objects(
+            schemas=(schema_used,),
+            pattern=normalized_pattern,
+            object_types=effective_types,
+        )
+        return Ok(result, schema_used=schema_used)
 
-            effective_types = self._normalize_object_types(object_types)
-            result = self._adapter.search_objects(
-                schemas=(schema_used,),
-                pattern=normalized_pattern,
-                object_types=effective_types,
-            )
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
-
-    def list_sequences(self, schema: str) -> Envelope:
+    @service_operation
+    def list_sequences(self, schema: str) -> Ok:
         """List sequences for the effective schema scope."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            result = self._adapter.list_sequences(schemas=(schema_used,))
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        result = self._adapter.list_sequences(schemas=(schema_used,))
+        return Ok(result, schema_used=schema_used)
 
-    def list_procedures(self, schema: str) -> Envelope:
+    @service_operation
+    def list_procedures(self, schema: str) -> Ok:
         """List procedures for the effective schema scope."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            result = self._adapter.list_procedures(schemas=(schema_used,))
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        result = self._adapter.list_procedures(schemas=(schema_used,))
+        return Ok(result, schema_used=schema_used)
 
-    def list_functions(self, schema: str) -> Envelope:
+    @service_operation
+    def list_functions(self, schema: str) -> Ok:
         """List functions for the effective schema scope."""
-        started = time.perf_counter()
-        try:
-            schema_used = self._require_schema(schema)
-            result = self._adapter.list_functions(schemas=(schema_used,))
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        result = self._adapter.list_functions(schemas=(schema_used,))
+        return Ok(result, schema_used=schema_used)
 
-    def list_jobs(self, schema: str) -> Envelope:
+    @service_operation
+    def list_jobs(self, schema: str) -> Ok:
         """List scheduler jobs, translating DB failures to validation-style errors."""
-        started = time.perf_counter()
+        schema_used = self._require_schema(schema)
         try:
-            schema_used = self._require_schema(schema)
             result = self._adapter.list_jobs()
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                schema_used=schema_used,
-                warnings=result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            if isinstance(err, DatabaseError):
-                err = ValidationError(err.code, err.message, err.details)
-            return error_from_exception(self._adapter.dialect, started, err)
+        except DatabaseError as err:
+            raise ValidationError(err.code, err.message, err.details) from err
+        return Ok(result, schema_used=schema_used)
 
+    @service_operation
     def sample_table(
         self,
         table: str,
         schema: str,
         limit: int | None,
         order_by: str | None,
-    ) -> Envelope:
+    ) -> Ok:
         """Return a bounded row sample from one table."""
-        started = time.perf_counter()
-        try:
-            if not table.strip():
-                raise ValidationError(
-                    "invalid_table", "Table name cannot be empty.")
+        if not table.strip():
+            raise ValidationError("invalid_table", "Table name cannot be empty.")
+        schema_used = self._require_schema(schema)
+        applied_limit, truncated, warnings = self._resolve_sample_limit(limit)
+        result = self._adapter.sample_table(
+            schema=schema_used,
+            table=table,
+            limit=applied_limit,
+            order_by=order_by,
+        )
+        return Ok(result, schema_used=schema_used, truncated=truncated, extra_warnings=warnings)
 
-            schema_used = self._require_schema(schema)
-            applied_limit, truncated, warnings = self._resolve_sample_limit(
-                limit)
-            result = self._adapter.sample_table(
-                schema=schema_used,
-                table=table,
-                limit=applied_limit,
-                order_by=order_by,
-            )
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                truncated=truncated or result.truncated,
-                schema_used=schema_used,
-                warnings=warnings + result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
-
+    @service_operation
     def select_columns(
         self,
         table: str,
         columns: list[str],
         schema: str,
         limit: int | None,
-    ) -> Envelope:
+    ) -> Ok:
         """Return a bounded row sample projected to requested columns."""
-        started = time.perf_counter()
-        try:
-            if not table.strip():
-                raise ValidationError(
-                    "invalid_table", "Table name cannot be empty.")
+        if not table.strip():
+            raise ValidationError("invalid_table", "Table name cannot be empty.")
+        if not columns:
+            raise ValidationError("invalid_columns", "At least one column must be provided.")
 
-            if not columns:
-                raise ValidationError(
-                    "invalid_columns", "At least one column must be provided.")
+        normalized_columns: list[str] = []
+        seen_columns: set[str] = set()
+        for column in columns:
+            if not isinstance(column, str):
+                raise ValidationError("invalid_columns", "Column names must be strings.")
+            normalized = column.strip()
+            if not normalized:
+                raise ValidationError("invalid_columns", "Column names cannot be empty.")
+            if not _IDENTIFIER_RE.match(normalized):
+                raise ValidationError("invalid_columns", f"Invalid column identifier: {normalized}")
+            key = normalized.lower()
+            if key not in seen_columns:
+                # Keep first occurrence order while removing case-insensitive duplicates.
+                seen_columns.add(key)
+                normalized_columns.append(normalized)
 
-            normalized_columns: list[str] = []
-            seen_columns: set[str] = set()
-            for column in columns:
-                if not isinstance(column, str):
-                    raise ValidationError(
-                        "invalid_columns", "Column names must be strings.")
-                normalized = column.strip()
-                if not normalized:
-                    raise ValidationError(
-                        "invalid_columns", "Column names cannot be empty.")
-                if not _IDENTIFIER_RE.match(normalized):
-                    raise ValidationError(
-                        "invalid_columns",
-                        f"Invalid column identifier: {normalized}",
-                    )
-                key = normalized.lower()
-                if key not in seen_columns:
-                    # Keep first occurrence order while removing case-insensitive duplicates.
-                    seen_columns.add(key)
-                    normalized_columns.append(normalized)
-
-            schema_used = self._require_schema(schema)
-            applied_limit, truncated, warnings = self._resolve_sample_limit(
-                limit)
-            result = self._adapter.select_columns(
-                schema=schema_used,
-                table=table,
-                columns=normalized_columns,
-                limit=applied_limit,
-            )
-            return success_envelope(
-                dialect=self._adapter.dialect,
-                data=result.data,
-                duration_ms=elapsed_ms(started),
-                truncated=truncated or result.truncated,
-                schema_used=schema_used,
-                warnings=warnings + result.warnings,
-                status=result.status,
-            )
-        except Exception as err:
-            return error_from_exception(self._adapter.dialect, started, err)
+        schema_used = self._require_schema(schema)
+        applied_limit, truncated, warnings = self._resolve_sample_limit(limit)
+        result = self._adapter.select_columns(
+            schema=schema_used,
+            table=table,
+            columns=normalized_columns,
+            limit=applied_limit,
+        )
+        return Ok(result, schema_used=schema_used, truncated=truncated, extra_warnings=warnings)

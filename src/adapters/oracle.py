@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 from urllib.parse import quote_plus
 
+from src.adapters._sql_helpers import (
+    ORDER_BY_RE,
+    degraded_or_raise,
+    int_or_none,
+    rows_from_cursor,
+)
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.adapters.normalization import normalize_rows
 from src.errors import DatabaseError, ValidationError
 
-_ORDER_BY_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(asc|desc))?\s*$", re.IGNORECASE)
+# Driver error fragments that mean "catalog/object not reachable", matched to
+# degrade gracefully instead of failing the whole call.
+_JOBS_UNAVAILABLE = ("ORA-00942", "ORA-01031")
+_DDL_NOT_FOUND = ("ORA-31603", "ORA-31604")
 
 
 class OracleAdapter(DatabaseAdapter):
@@ -84,11 +91,7 @@ class OracleAdapter(DatabaseAdapter):
                         setattr(conn, "callTimeout", int(timeout_ms))
                 with conn.cursor() as cur:
                     cur.execute(query, params or {})
-                    if cur.description is None:
-                        return []
-                    columns = [desc[0].lower() for desc in cur.description]
-                    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
-                    return normalize_rows(rows)
+                    return rows_from_cursor(cur)
         except DatabaseError:
             raise
         except Exception as exc:
@@ -112,13 +115,6 @@ class OracleAdapter(DatabaseAdapter):
         """Safely quote Oracle identifiers using double quotes."""
         return f"\"{identifier.replace('\"', '\"\"')}\""
 
-    @staticmethod
-    def _int_or_none(value: Any) -> int | None:
-        """Convert Oracle numeric metadata values to ints when available."""
-        if value is None or value == "":
-            return None
-        return int(value)
-
     def _with_full_data_type(self, rows: list[dict]) -> list[dict]:
         """Attach formatted Oracle type names and strip internal helper columns."""
         formatted_rows: list[dict] = []
@@ -126,10 +122,10 @@ class OracleAdapter(DatabaseAdapter):
             data_type = str(row.get("data_type") or "")
             normalized_type = data_type.upper()
             char_used = str(row.get("helper_char_used") or "").upper()
-            char_length = self._int_or_none(row.get("helper_char_length"))
-            data_length = self._int_or_none(row.get("helper_data_length"))
-            data_precision = self._int_or_none(row.get("helper_data_precision"))
-            data_scale = self._int_or_none(row.get("helper_data_scale"))
+            char_length = int_or_none(row.get("helper_char_length"))
+            data_length = int_or_none(row.get("helper_data_length"))
+            data_precision = int_or_none(row.get("helper_data_precision"))
+            data_scale = int_or_none(row.get("helper_data_scale"))
 
             full_data_type = data_type
             if normalized_type in {"CHAR", "VARCHAR2"}:
@@ -260,7 +256,7 @@ class OracleAdapter(DatabaseAdapter):
                 r.owner AS foreign_table_schema,
                 r.table_name AS foreign_table_name,
                 LISTAGG(rcol.column_name, ', ') WITHIN GROUP (ORDER BY rcol.position) AS foreign_columns,
-                NULL AS check_clause
+                c.search_condition_vc AS check_clause
             FROM all_constraints c
             LEFT JOIN all_cons_columns col
               ON c.owner = col.owner
@@ -276,7 +272,8 @@ class OracleAdapter(DatabaseAdapter):
               AND c.constraint_type IN ('P','R','U','C')
               AND (:table_name IS NULL OR c.table_name = :table_name)
               AND (:constraint_type IS NULL OR c.constraint_type = :constraint_type)
-            GROUP BY c.owner, c.table_name, c.constraint_name, c.constraint_type, r.owner, r.table_name
+            GROUP BY c.owner, c.table_name, c.constraint_name, c.constraint_type,
+                     r.owner, r.table_name, c.search_condition_vc
             ORDER BY c.owner, c.table_name, c.constraint_name
         """
         data = self._fetch_all(query, params)
@@ -289,6 +286,9 @@ class OracleAdapter(DatabaseAdapter):
             SELECT
                 sequence_owner AS schema,
                 sequence_name,
+                -- Oracle does not retain the original START WITH; expose the key
+                -- as NULL so the row shape matches the other dialects.
+                NULL AS start_value,
                 min_value,
                 max_value,
                 increment_by,
@@ -358,14 +358,11 @@ class OracleAdapter(DatabaseAdapter):
             return AdapterResult(data=data, status="available")
         except DatabaseError as exc:
             details = str(exc.details or "")
-            if "ORA-00942" in details or "ORA-01031" in details:
-                return AdapterResult(
-                    data=[],
-                    warnings=[
-                        "Oracle scheduler catalog is not available for this user."],
-                    status="not_available",
-                )
-            raise
+            return degraded_or_raise(
+                exc,
+                matched=any(code in details for code in _JOBS_UNAVAILABLE),
+                warning="Oracle scheduler catalog is not available for this user.",
+            )
 
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
         """List indexes for selected schemas, optionally filtered by table."""
@@ -431,16 +428,12 @@ class OracleAdapter(DatabaseAdapter):
             )
         except DatabaseError as exc:
             details = str(exc.details or "")
-            if "ORA-31603" in details or "ORA-31604" in details:
-                return AdapterResult(
-                    data=[],
-                    warnings=[
-                        f"No {normalized_type.lower()} "
-                        f"'{schema}.{object_name}' found."
-                    ],
-                    status="not_found",
-                )
-            raise
+            return degraded_or_raise(
+                exc,
+                matched=any(code in details for code in _DDL_NOT_FOUND),
+                warning=f"No {normalized_type.lower()} '{schema}.{object_name}' found.",
+                status="not_found",
+            )
         return AdapterResult(data=data, status="available")
 
     def search_objects(
@@ -497,7 +490,7 @@ class OracleAdapter(DatabaseAdapter):
         table_q = self._q(table.upper())
         query = f"SELECT * FROM {schema_q}.{table_q}"
         if order_by:
-            match = _ORDER_BY_RE.match(order_by)
+            match = ORDER_BY_RE.match(order_by)
             if not match:
                 raise ValidationError(
                     "invalid_order_by",

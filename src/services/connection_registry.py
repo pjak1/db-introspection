@@ -11,6 +11,16 @@ from src.services.introspection_service import IntrospectionService
 from src.services.select_service import SelectService
 
 
+def normalize_connection_key(connection: str | None) -> str:
+    """Canonicalize a connection key: `\\` -> `/`, collapse `//`, strip.
+
+    Pure string canonicalization with no validation — the single source of truth
+    shared by the registry (which adds strict validation on top) and the write
+    plugin allowlist, so both compare identical canonical keys.
+    """
+    return re.sub(r"/+", "/", (connection or "").strip().replace("\\", "/"))
+
+
 @dataclass
 class _CachedServices:
     """Cache entry storing services and the source file modification timestamp."""
@@ -36,7 +46,7 @@ class ConnectionRegistry:
         if connection is None or not connection.strip():
             raise ValidationError("missing_connection_schema", "connection is required.")
 
-        normalized = re.sub(r"/+", "/", connection.strip().replace("\\", "/"))
+        normalized = normalize_connection_key(connection)
         parts = normalized.split("/")
         if len(parts) != 3 or any(not part for part in parts):
             raise ValidationError(

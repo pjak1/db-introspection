@@ -1,78 +1,16 @@
-﻿
-from src.adapters.base import AdapterResult, DatabaseAdapter
-from src.config import Settings
+from conftest import BaseStubAdapter, make_settings
+
+from src.adapters.base import AdapterResult
 from src.services.select_service import SelectService
 
 
-class StubAdapter(DatabaseAdapter):
+class StubAdapter(BaseStubAdapter):
     def __init__(self, dialect: str):
         self._dialect = dialect
         self.captured_run_sql: str | None = None
         self.captured_explain_sql: str | None = None
         self.captured_timeout: int | None = None
         self.captured_method: str | None = None
-
-    @property
-    def dialect(self) -> str:
-        return self._dialect
-
-    def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_columns(self, table: str, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_constraints(
-        self,
-        schemas: tuple[str, ...],
-        table: str | None = None,
-        constraint_type: str | None = None,
-    ) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_sequences(self, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_procedures(self, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_functions(self, schemas: tuple[str, ...]) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_jobs(self) -> AdapterResult:
-        raise NotImplementedError
-
-    def sample_table(
-        self,
-        schema: str,
-        table: str,
-        limit: int,
-        order_by: str | None,
-    ) -> AdapterResult:
-        raise NotImplementedError
-
-    def select_columns(
-        self,
-        schema: str,
-        table: str,
-        columns: list[str],
-        limit: int,
-    ) -> AdapterResult:
-        raise NotImplementedError
-
-    def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-        raise NotImplementedError
-
-    def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
-        raise NotImplementedError
-
-    def search_objects(
-        self,
-        schemas: tuple[str, ...],
-        pattern: str,
-        object_types: tuple[str, ...],
-    ) -> AdapterResult:
-        raise NotImplementedError
 
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         self.captured_method = "run_select"
@@ -86,21 +24,9 @@ class StubAdapter(DatabaseAdapter):
         self.captured_timeout = timeout_ms
         return AdapterResult(data=[{"plan_text": "Seq Scan on users"}], status="explain")
 
-    def open_connection(self):
-        raise NotImplementedError
 
-
-def _settings() -> Settings:
-    return Settings(
-        db_dialect="postgres",
-        db_dsn="postgresql://localhost/db",
-        allowed_schemas=("public",),
-        default_sample_limit=10,
-        max_sample_limit=100,
-        max_select_limit=200,
-        statement_timeout_ms=5000,
-        include_system_schemas=False,
-    )
+def _settings():
+    return make_settings(db_dsn="postgresql://localhost/db")
 
 
 def test_select_service_wraps_postgres_query():
@@ -160,4 +86,3 @@ def test_select_service_explain_uses_original_sql_and_ignores_limit():
     assert envelope["meta"]["warnings"] == [
         "Requested limit 10 was ignored because explain=True plans the original SQL."
     ]
-

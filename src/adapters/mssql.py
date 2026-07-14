@@ -3,18 +3,23 @@
 import re
 from typing import Any
 
+from src.adapters._sql_helpers import (
+    ORDER_BY_RE,
+    degraded_or_raise,
+    int_or_none,
+    rows_from_cursor,
+)
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.adapters.normalization import normalize_rows
 from src.errors import DatabaseError, ValidationError
-
-_ORDER_BY_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_$]*)(?:\s+(asc|desc))?\s*$", re.IGNORECASE)
 
 
 class MssqlAdapter(DatabaseAdapter):
     """Microsoft SQL Server implementation of the generic adapter contract."""
     dialect_name = "mssql"
     dsn_env_var = "MSSQL_DSN"
+    # Table DDL is not reconstructed on SQL Server; use db_list_columns/constraints/indexes.
+    ddl_object_types = ("view", "procedure", "function")
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use ODBC connection string."""
@@ -204,23 +209,16 @@ class MssqlAdapter(DatabaseAdapter):
         """Safely quote SQL Server identifiers using brackets."""
         return f"[{identifier.replace(']', ']]')}]"
 
-    @staticmethod
-    def _int_or_none(value: Any) -> int | None:
-        """Convert SQL Server metadata values to ints when available."""
-        if value is None or value == "":
-            return None
-        return int(value)
-
     def _with_full_data_type(self, rows: list[dict]) -> list[dict]:
         """Attach formatted SQL Server type names and strip helper metadata."""
         formatted_rows: list[dict] = []
         for row in rows:
             data_type = str(row.get("data_type") or "")
             normalized_type = data_type.lower()
-            char_length = self._int_or_none(row.get("_character_maximum_length"))
-            numeric_precision = self._int_or_none(row.get("_numeric_precision"))
-            numeric_scale = self._int_or_none(row.get("_numeric_scale"))
-            datetime_precision = self._int_or_none(row.get("_datetime_precision"))
+            char_length = int_or_none(row.get("_character_maximum_length"))
+            numeric_precision = int_or_none(row.get("_numeric_precision"))
+            numeric_scale = int_or_none(row.get("_numeric_scale"))
+            datetime_precision = int_or_none(row.get("_datetime_precision"))
 
             full_data_type = data_type
             if normalized_type in {"char", "varchar", "binary", "varbinary", "nchar", "nvarchar"}:
@@ -267,11 +265,7 @@ class MssqlAdapter(DatabaseAdapter):
                     if timeout_ms is not None:
                         conn.timeout = max(1, int(timeout_ms) // 1000)
                     cur.execute(query, params or ())
-                    if cur.description is None:
-                        return []
-                    columns = [desc[0].lower() for desc in cur.description]
-                    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
-                    return normalize_rows(rows)
+                    return rows_from_cursor(cur)
         except DatabaseError:
             raise
         except Exception as exc:
@@ -468,17 +462,11 @@ class MssqlAdapter(DatabaseAdapter):
             # SQLSTATE for object not found.
             missing_catalog = "42s02" in details
             permission_denied = "(229)" in details or "permission" in details or "denied" in details
-            if (
-                has_sysjobs_target
-                and (missing_catalog or permission_denied)
-            ):
-                return AdapterResult(
-                    data=[],
-                    warnings=[
-                        "SQL Server scheduler catalog (Agent jobs) is not available for this user."],
-                    status="not_available",
-                )
-            raise
+            return degraded_or_raise(
+                exc,
+                matched=has_sysjobs_target and (missing_catalog or permission_denied),
+                warning="SQL Server scheduler catalog (Agent jobs) is not available for this user.",
+            )
 
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
         """List indexes for selected schemas, optionally filtered by table."""
@@ -593,7 +581,7 @@ class MssqlAdapter(DatabaseAdapter):
         table_q = self._q(table)
         query = f"SELECT TOP ({int(limit)}) * FROM {schema_q}.{table_q}"
         if order_by:
-            match = _ORDER_BY_RE.match(order_by)
+            match = ORDER_BY_RE.match(order_by)
             if not match:
                 raise ValidationError(
                     "invalid_order_by",

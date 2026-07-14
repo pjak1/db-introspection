@@ -68,6 +68,16 @@ Enabling writes requires four deliberate steps:
 
 Remove the plugin file or unset `DB_ENABLE_WRITE_PLUGINS` and restart to fully disable writes again. See [`plugins/README.md`](plugins/README.md) for the plugin contract and security notes.
 
+## Security / threat model
+
+The read-only guarantee for `db_run_select` is enforced by `QueryGuard` (`src/services/query_guard.py`), a **lexical** check: it requires the statement to start with `SELECT`/`WITH`, rejects a blocklist of write/DDL keywords, forbids multiple statements, and strips comments and string literals so keywords hidden inside them are ignored.
+
+Because this is lexical (not a full SQL parser plus execution sandbox), it **cannot see side-effecting functions** invoked from an otherwise valid `SELECT` — for example PostgreSQL `pg_sleep()`, `nextval()`, `dblink()`/`lo_export()`, Oracle `DBMS_*` packages, or SQL Server `xp_cmdshell`. A crafted `SELECT` that calls such a function passes the guard.
+
+**Recommended defense in depth:** run this server against a **least-privilege, read-only database user** (grant only `SELECT`/catalog access, no write/DDL/exec rights). That way the database itself enforces read-only regardless of what SQL reaches it, and the lexical guard is only the first layer. Do not rely on `QueryGuard` alone as a security boundary against a hostile query author.
+
+The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) is the only sanctioned way to mutate data, and even then only for connections on the `DB_WRITABLE_CONNECTIONS` allowlist.
+
 ## Tool usage
 
 - `db_list_connections()`

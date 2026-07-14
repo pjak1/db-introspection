@@ -112,7 +112,22 @@ def test_db_list_connections_returns_connection_names(monkeypatch):
 
     result = server.db_list_connections()
 
-    assert result == {"ok": True, "connections": ["A/DEV/dbo", "B/INT/public"]}
+    assert result["ok"] is True
+    assert result["data"] == ["A/DEV/dbo", "B/INT/public"]
+
+
+def test_db_list_connections_uses_the_shared_envelope_shape(monkeypatch):
+    monkeypatch.setattr(server, "connection_registry", FakeRegistry())
+
+    result = server.db_list_connections()
+
+    # Consistent with every other tool: full Envelope, not a bespoke dict.
+    assert set(result) == {"ok", "dialect", "data", "meta", "error"}
+    assert result["error"] is None
+    assert result["dialect"] == "unknown"
+    assert result["meta"]["row_count"] == 2
+    assert result["meta"]["warnings"] == []
+    assert result["meta"]["status"] is None
 
 
 def test_db_tool_routes_to_selected_connection(monkeypatch):
