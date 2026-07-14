@@ -86,6 +86,9 @@ class StubAdapter(DatabaseAdapter):
         self.captured_timeout = timeout_ms
         return AdapterResult(data=[{"plan_text": "Seq Scan on users"}], status="explain")
 
+    def open_connection(self):
+        raise NotImplementedError
+
 
 def _settings() -> Settings:
     return Settings(

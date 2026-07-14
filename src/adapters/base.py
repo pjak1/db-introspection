@@ -102,6 +102,11 @@ class DatabaseAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def open_connection(self) -> Any:
+        """Open a new read/write-capable DBAPI connection (implemented per dialect)."""
+        raise NotImplementedError
+
+    @abstractmethod
     def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
         """List tables/views for the given schema scope."""
         raise NotImplementedError

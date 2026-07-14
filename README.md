@@ -31,6 +31,43 @@ driver:ODBC Driver 18 for SQL Server
 `connection` parameter identifies a full path key in format `project/environment/schema`.
 Server accepts both separators (`/` and `\`) in input, but `db_list_connections()` always returns canonical keys with `/`.
 
+## Secrets via environment variables
+
+To keep credentials out of plaintext files, any value in `db_conn.txt` can reference an environment variable with `${VAR}`. The reference is resolved when the file is read; if the variable is unset, the connection fails with a clear `invalid_config` error naming the missing variable (never its value).
+
+```txt
+dialect:mssql
+host:sql-host.example.local
+db_name:app_db
+port:1433
+username:${EXAMPLE_PROJECT_ENV_SCHEMA_USERNAME}
+password:${EXAMPLE_PROJECT_ENV_SCHEMA_PASSWORD}
+schema:schema_a,schema_b
+driver:ODBC Driver 18 for SQL Server
+```
+
+Provide the values either as real environment variables or in a project-root `.env` file (gitignored). Copy `.env.example` to `.env` and fill in the secrets:
+
+```
+EXAMPLE_PROJECT_ENV_SCHEMA_USERNAME=example_user
+EXAMPLE_PROJECT_ENV_SCHEMA_PASSWORD=change_me
+```
+
+Recommended variable naming: `<PROJECT>_<ENVIRONMENT>_<SCHEMA>_<FIELD>`. Real environment variables take precedence over `.env`. This is opt-in and backward compatible: values without `${...}` are still used literally, so at minimum move `password` (and ideally `username`) to `${VAR}` references.
+
+## Write/DDL capabilities (opt-in plugin)
+
+The server is **strictly read-only** by default and contains no write/DDL code. Write and DDL capabilities can only be added by **manually installing a plugin** into the gitignored `plugins/` directory — an MCP client/agent can never do this itself.
+
+Enabling writes requires four deliberate steps:
+
+1. Copy a plugin into `plugins/` (a reference implementation is at [`docs/plugins/example_write_plugin.py.example`](docs/plugins/example_write_plugin.py.example)).
+2. Set `DB_ENABLE_WRITE_PLUGINS=1` (without it, plugin files are ignored).
+3. Set `DB_WRITABLE_CONNECTIONS` to a comma-separated list of canonical `project/environment/schema` keys allowed to be written to (e.g. `PROJECT_A/DEV/schema_a`). Connections not listed stay read-only; an empty/unset list means nothing is writable.
+4. Restart the server (loaded plugins are logged to stderr).
+
+Remove the plugin file or unset `DB_ENABLE_WRITE_PLUGINS` and restart to fully disable writes again. See [`plugins/README.md`](plugins/README.md) for the plugin contract and security notes.
+
 ## Tool usage
 
 - `db_list_connections()`

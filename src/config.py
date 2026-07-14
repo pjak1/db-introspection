@@ -1,18 +1,54 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 from src.adapters.base import DatabaseAdapter
 from src.adapters.discovery import ensure_adapter_modules_loaded
 from src.errors import ConfigError
+
+# Load secrets from a project-root `.env` once at import time. Real environment
+# variables take precedence (override=False), and the file is optional.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+# Connection-file values may reference environment variables with `${VAR}`, so
+# secrets (username/password) can live in the environment instead of on disk.
+# A literal `${...}` is written `$${...}`: the `$$` (only when it precedes `{`)
+# is the escape and collapses to a single `$` without expanding. A bare `$` or
+# `$$` not followed by `{` is left untouched, so existing values keep working.
+_ENV_REF_PATTERN = re.compile(r"\$\$(?=\{)|\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _default_conn_file_path() -> Path:
     """Return the default path to `db_conn.txt` located in the project root."""
     # src/config.py -> project root (directory containing server.py)
     return Path(__file__).resolve().parent.parent / "db_conn.txt"
+
+
+def _expand_env_refs(key: str, value: str) -> str:
+    """Replace `${VAR}` references with environment values; fail if one is unset.
+
+    `$${` is an escape: it collapses to a literal `${` and is not expanded, so a
+    value that must contain a literal `${...}` is written `$${...}`.
+    """
+    def _replace(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        if var_name is None:  # matched the `$$` escape before a `{`
+            return "$"
+        env_value = os.environ.get(var_name)
+        if env_value is None:
+            raise ConfigError(
+                "invalid_config",
+                f"Connection field '{key}' references undefined "
+                f"environment variable '{var_name}'.",
+            )
+        return env_value
+
+    return _ENV_REF_PATTERN.sub(_replace, value)
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -51,7 +87,7 @@ def read_connection_file(path: Path) -> dict[str, str]:
         key = key.strip().lower()
         value = value.strip()
         if key and value:
-            values[key] = value
+            values[key] = _expand_env_refs(key, value)
     return values
 
 

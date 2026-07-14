@@ -53,6 +53,14 @@ class PostgresAdapter(DatabaseAdapter):
         """Wrap a query to enforce row limit in PostgreSQL syntax."""
         return f"SELECT * FROM ({query}) AS mcp_subquery LIMIT {int(limit)}"
 
+    def open_connection(self) -> Any:
+        """Create and return a PostgreSQL connection, translating driver errors."""
+        try:
+            return psycopg.connect(self._dsn, autocommit=False)
+        except psycopg.Error as exc:
+            raise DatabaseError(
+                "database_error", "PostgreSQL connection failed.", details=str(exc)) from exc
+
     def _fetch_all(
         self,
         query: str | sql.Composable,
@@ -61,7 +69,7 @@ class PostgresAdapter(DatabaseAdapter):
     ) -> list[dict]:
         """Execute SQL and return normalized rows as dictionaries."""
         try:
-            with psycopg.connect(self._dsn, autocommit=False) as conn:
+            with self.open_connection() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     if timeout_ms is not None:
                         cur.execute(

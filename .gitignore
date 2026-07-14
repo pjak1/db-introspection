@@ -137,6 +137,7 @@ celerybeat.pid
 # Environments
 .env
 .env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -212,3 +213,7 @@ DB_conns/*
 **/db_conn.txt
 !DB_conns/.example_project/
 !DB_conns/.example_project/**
+
+# Write/DDL capability plugins (opt-in, installed manually, never committed)
+plugins/*
+!plugins/README.md

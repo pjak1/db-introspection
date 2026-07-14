@@ -106,7 +106,7 @@ def test_mssql_list_columns_adds_full_data_type(monkeypatch):
 
 def test_mssql_explain_select_uses_showplan_text(monkeypatch):
     conn = _MssqlConnection()
-    monkeypatch.setattr(MssqlAdapter, "_connect", lambda self: conn)
+    monkeypatch.setattr(MssqlAdapter, "open_connection", lambda self: conn)
     adapter = MssqlAdapter(dsn="Driver=test")
 
     result = adapter.explain_select("SELECT * FROM dbo.Users", timeout_ms=1200)

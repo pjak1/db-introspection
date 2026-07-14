@@ -79,6 +79,9 @@ class DummyAdapter(DatabaseAdapter):
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         return AdapterResult(data=[])
 
+    def open_connection(self):
+        raise NotImplementedError
+
 
 def _write_conn(path: Path, *, schema: str = "public") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,79 @@
+# Example write/DDL capability plugin — REFERENCE ONLY, NOT ACTIVE.
+#
+# This file is intentionally NOT importable by the loader: it lives in docs/ and
+# carries a `.py.example` suffix, so the loader (which only imports `plugins/*.py`)
+# never sees it. To use it, copy it to `plugins/write_tools.py`, then follow the
+# activation steps in plugins/README.md.
+#
+# WHY the mutation code lives here (in the plugin) and not in the core codebase:
+# the core ships strictly read-only. The plugin reuses the core adapter only to
+# OPEN a connection (the same one reads use, via `open_connection()`); the actual
+# execute + commit — the mutation — happens only here. When no plugin is installed
+# there is nothing that commits, so the MCP server exposes only its read-only tools.
+
+from __future__ import annotations
+
+import time
+
+from src.plugins.api import (
+    MUTATING,
+    DatabaseError,
+    PluginContext,
+    elapsed_ms,
+    error_from_exception,
+    success_envelope,
+)
+
+
+def register(context: PluginContext) -> None:
+    """Entry point called by the loader. Register write/DDL tools here."""
+
+    def db_execute_write(connection: str, sql: str) -> dict:
+        """Execute a single write/DDL statement against an allowlisted connection.
+
+        `connection` is a 'project/environment/schema' key. Writes are only
+        permitted for connections listed in DB_WRITABLE_CONNECTIONS.
+        """
+        started = time.perf_counter()
+
+        # Build the adapter first so even error envelopes carry the dialect.
+        try:
+            adapter = context.adapter_for(connection)
+        except Exception as exc:
+            return error_from_exception("unknown", started, exc)
+
+        try:
+            context.require_writable(connection)
+            affected = _execute(adapter, sql)
+            return success_envelope(
+                dialect=adapter.dialect,
+                data={"rows_affected": affected},
+                duration_ms=elapsed_ms(started),
+                status="ok",
+            )
+        except Exception as exc:
+            return error_from_exception(adapter.dialect, started, exc)
+
+    # Register with MUTATING annotations so MCP clients know this is destructive.
+    context.mcp.add_tool(
+        db_execute_write,
+        name="db_execute_write",
+        annotations=MUTATING,
+    )
+
+
+def _execute(adapter, sql: str) -> int:
+    """Open a writable connection via the adapter, run one statement, commit.
+
+    Dialect-agnostic: `open_connection()` is the same connection the read-only
+    path uses, so this works for every core DB without importing any driver.
+    """
+    try:
+        with adapter.open_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                affected = cur.rowcount
+            conn.commit()  # the mutation; mandatory for Oracle (rolls back otherwise)
+            return affected
+    except Exception as exc:
+        raise DatabaseError("database_error", "Write failed.", details=str(exc)) from exc

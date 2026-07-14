@@ -76,6 +76,9 @@ class DummyAdapter(DatabaseAdapter):
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         raise NotImplementedError
 
+    def open_connection(self):
+        raise NotImplementedError
+
 
 def _settings(*, db_dialect: str, allowed_schemas: tuple[str, ...]) -> Settings:
     return Settings(

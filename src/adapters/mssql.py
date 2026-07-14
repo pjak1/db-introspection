@@ -183,7 +183,7 @@ class MssqlAdapter(DatabaseAdapter):
         # OFFSET-FETCH requires ORDER BY; add a no-op ordering for an unordered query.
         return f"{sql} ORDER BY (SELECT NULL) {fetch}"
 
-    def _connect(self) -> Any:
+    def open_connection(self) -> Any:
         """Create and return an ODBC connection, translating driver errors."""
         try:
             import pyodbc  # type: ignore
@@ -262,7 +262,7 @@ class MssqlAdapter(DatabaseAdapter):
     ) -> list[dict]:
         """Execute SQL and return normalized rows as dictionaries."""
         try:
-            with self._connect() as conn:
+            with self.open_connection() as conn:
                 with conn.cursor() as cur:
                     if timeout_ms is not None:
                         conn.timeout = max(1, int(timeout_ms) // 1000)
@@ -628,7 +628,7 @@ class MssqlAdapter(DatabaseAdapter):
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         """Return a SQL Server estimated execution plan for a validated SELECT."""
         try:
-            with self._connect() as conn:
+            with self.open_connection() as conn:
                 conn.timeout = max(1, int(timeout_ms) // 1000)
                 with conn.cursor() as cur:
                     cur.execute("SET SHOWPLAN_TEXT ON")

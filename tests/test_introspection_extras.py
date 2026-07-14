@@ -252,6 +252,9 @@ class _StubAdapter(DatabaseAdapter):
             "schemas": schemas, "pattern": pattern, "object_types": object_types}
         return AdapterResult(data=[], status="available")
 
+    def open_connection(self):
+        raise NotImplementedError
+
 
 def _settings() -> Settings:
     return Settings(

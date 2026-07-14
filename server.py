@@ -347,4 +347,11 @@ def db_search_objects(
 
 
 if __name__ == "__main__":
+    # Load opt-in write/DDL plugins (inert unless DB_ENABLE_WRITE_PLUGINS is set
+    # and a plugin file is manually installed in plugins/). Done here rather than
+    # at import time so importing this module (e.g. in tests) never activates them.
+    from src.plugins.api import PluginContext
+    from src.plugins.loader import load_plugins
+
+    load_plugins(PluginContext(mcp=mcp, connection_registry=connection_registry))
     mcp.run(transport="stdio")

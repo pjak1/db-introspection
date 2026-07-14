@@ -102,6 +102,9 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
         def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[{"plan_text": sql_query}], status="explain")
 
+        def open_connection(self):
+            raise NotImplementedError
+
     DynamicAdapter.dialect_name = dialect
     DatabaseAdapter._registry[dialect] = DynamicAdapter
 
@@ -187,6 +190,9 @@ def test_adapter_class_registers_automatically():
 
         def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
             return AdapterResult(data=[])
+
+        def open_connection(self):
+            raise NotImplementedError
 
     try:
         assert DatabaseAdapter.adapter_class_for(dialect) is AutoAdapter

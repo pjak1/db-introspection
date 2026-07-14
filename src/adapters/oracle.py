@@ -51,7 +51,7 @@ class OracleAdapter(DatabaseAdapter):
         """Wrap a query to enforce row limit in Oracle syntax."""
         return f"SELECT * FROM ({query}) mcp_subquery FETCH FIRST {int(limit)} ROWS ONLY"
 
-    def _connect(self) -> Any:
+    def open_connection(self) -> Any:
         """Create and return an Oracle connection, translating driver errors."""
         try:
             import oracledb  # type: ignore
@@ -75,7 +75,7 @@ class OracleAdapter(DatabaseAdapter):
     ) -> list[dict]:
         """Execute SQL and return normalized rows as dictionaries."""
         try:
-            with self._connect() as conn:
+            with self.open_connection() as conn:
                 # python-oracledb timeout property name differs by version.
                 if timeout_ms is not None:
                     if hasattr(conn, "call_timeout"):
@@ -533,7 +533,7 @@ class OracleAdapter(DatabaseAdapter):
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         """Return an Oracle estimated execution plan for a validated SELECT."""
         try:
-            with self._connect() as conn:
+            with self.open_connection() as conn:
                 if hasattr(conn, "call_timeout"):
                     setattr(conn, "call_timeout", int(timeout_ms))
                 if hasattr(conn, "callTimeout"):

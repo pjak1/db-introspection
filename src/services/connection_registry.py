@@ -90,13 +90,20 @@ class ConnectionRegistry:
             )
         return conn_file
 
-    def _build_services(self, conn_file: Path) -> _CachedServices:
-        """Build fresh introspection/select services from a connection file."""
+    def build_settings(self, connection: str) -> Settings:
+        """Resolve a connection key to validated Settings (DSN, dialect, limits)."""
+        return self._settings_from_file(self.resolve_conn_file(connection))
+
+    def _settings_from_file(self, conn_file: Path) -> Settings:
+        """Build validated Settings from a connection file."""
         conn_values = read_connection_file(conn_file)
         if not conn_values:
             raise ConfigError("invalid_config", f"Connection file is empty: {conn_file}")
+        return Settings.from_connection_values(conn_values=conn_values)
 
-        settings = Settings.from_connection_values(conn_values=conn_values)
+    def _build_services(self, conn_file: Path) -> _CachedServices:
+        """Build fresh introspection/select services from a connection file."""
+        settings = self._settings_from_file(conn_file)
         adapter = create_adapter(settings)
         introspection_service = IntrospectionService(adapter=adapter, settings=settings)
         select_service = SelectService(adapter=adapter, settings=settings)

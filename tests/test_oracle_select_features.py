@@ -83,7 +83,7 @@ def test_oracle_list_columns_adds_full_data_type(monkeypatch):
 
 def test_oracle_explain_select_uses_dbms_xplan_display(monkeypatch):
     conn = _OracleConnection()
-    monkeypatch.setattr(OracleAdapter, "_connect", lambda self: conn)
+    monkeypatch.setattr(OracleAdapter, "open_connection", lambda self: conn)
     adapter = OracleAdapter(dsn="user/pass@db")
 
     result = adapter.explain_select("SELECT * FROM users", timeout_ms=1400)
