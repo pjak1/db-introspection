@@ -93,13 +93,91 @@ def test_postgres_get_ddl_function_passes_prokind():
     assert captured["params"] == ("function", "public", "f", "f")
 
 
-def test_postgres_get_ddl_table_is_not_supported():
+def _stub_fetch_by_query(adapter, responder):
+    """Patch `_fetch_all` to return rows chosen by inspecting the query text."""
+    def fake_fetch(query, params=None, timeout_ms=None):  # noqa: ANN001
+        return responder(query, params)
+    adapter._fetch_all = fake_fetch  # type: ignore[method-assign]
+
+
+def test_postgres_get_ddl_table_reconstructs_create_table():
     adapter = PostgresAdapter("postgresql://unused")
-    _capture(adapter)
+
+    def responder(query, params):
+        if "pg_get_constraintdef" in query:
+            return [{"name": "users_pkey", "def": "PRIMARY KEY (id)"}]
+        if "pg_get_indexdef" in query:
+            return [{"def": "CREATE INDEX ix_users_name ON public.users USING btree (name)"}]
+        # columns
+        return [
+            {"name": "id", "type": "integer", "notnull": True,
+             "default_expr": None, "identity": "a", "generated": ""},
+            {"name": "name", "type": "text", "notnull": False,
+             "default_expr": "'x'::text", "identity": "", "generated": ""},
+        ]
+
+    _stub_fetch_by_query(adapter, responder)
     result = adapter.get_ddl(schema="public", object_name="users", object_type="table")
 
-    assert result.status == "not_supported"
+    assert result.status == "available"
+    ddl = result.data[0]["ddl"]
+    assert result.data[0]["object_type"] == "table"
+    assert 'CREATE TABLE "public"."users"' in ddl
+    assert '"id" integer GENERATED ALWAYS AS IDENTITY NOT NULL' in ddl
+    assert '"name" text DEFAULT \'x\'::text' in ddl
+    assert 'CONSTRAINT "users_pkey" PRIMARY KEY (id)' in ddl
+    assert ddl.rstrip().endswith(
+        "CREATE INDEX ix_users_name ON public.users USING btree (name);")
+    assert any("reconstructed" in w for w in result.warnings)
+
+
+def test_postgres_get_ddl_table_not_found_when_no_columns():
+    adapter = PostgresAdapter("postgresql://unused")
+    _stub_fetch_by_query(adapter, lambda query, params: [])
+    result = adapter.get_ddl(schema="public", object_name="ghost", object_type="table")
+
+    assert result.status == "not_found"
     assert result.data == []
+
+
+def test_mssql_get_ddl_table_reconstructs_create_table():
+    adapter = MssqlAdapter("Driver=test")
+
+    def responder(query, params):
+        if "sys.columns c" in query and "JOIN sys.types" in query:
+            return [
+                {"name": "id", "data_type": "int", "_max_length": 4,
+                 "_precision": 10, "_scale": 0, "is_nullable": False,
+                 "is_identity": True, "seed_value": "1", "increment_value": "1",
+                 "default_def": None, "computed_def": None},
+                {"name": "name", "data_type": "nvarchar", "_max_length": 100,
+                 "_precision": 0, "_scale": 0, "is_nullable": True,
+                 "is_identity": False, "seed_value": None, "increment_value": None,
+                 "default_def": None, "computed_def": None},
+            ]
+        if "sys.key_constraints" in query:
+            return [{"name": "PK_t", "ctype": "PK", "cols": "[id]"}]
+        if "sys.foreign_keys" in query:
+            return []
+        if "sys.check_constraints" in query:
+            return []
+        if "sys.indexes" in query:
+            return [{"name": "IX_name", "is_unique": False,
+                     "type_desc": "NONCLUSTERED", "cols": "[name]", "included": None}]
+        return []
+
+    _stub_fetch_by_query(adapter, responder)
+    result = adapter.get_ddl(schema="dbo", object_name="t", object_type="table")
+
+    assert result.status == "available"
+    ddl = result.data[0]["ddl"]
+    assert "CREATE TABLE [dbo].[t]" in ddl
+    assert "[id] int IDENTITY(1,1) NOT NULL" in ddl
+    assert "[name] nvarchar(50) NULL" in ddl  # 100 bytes -> 50 chars
+    assert "CONSTRAINT [PK_t] PRIMARY KEY ([id])" in ddl
+    assert ddl.rstrip().endswith(
+        "CREATE NONCLUSTERED INDEX [IX_name] ON [dbo].[t] ([name]);")
+    assert any("reconstructed" in w for w in result.warnings)
 
 
 def test_mssql_get_ddl_uses_object_definition():
@@ -307,11 +385,11 @@ def test_oracle_list_constraints_returns_real_check_clause():
 
 
 def test_ddl_object_types_are_dialect_accurate():
-    # The advertised DDL object types must match what each dialect really supports:
-    # only Oracle reconstructs table DDL.
+    # All three dialects can return table DDL: Oracle via DBMS_METADATA, and
+    # PostgreSQL/SQL Server via catalog reconstruction.
     assert "table" in OracleAdapter.ddl_object_types
-    assert "table" not in PostgresAdapter.ddl_object_types
-    assert "table" not in MssqlAdapter.ddl_object_types
+    assert "table" in PostgresAdapter.ddl_object_types
+    assert "table" in MssqlAdapter.ddl_object_types
 
 
 def test_get_ddl_table_rejected_when_dialect_excludes_it():

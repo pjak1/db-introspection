@@ -22,6 +22,15 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # `$$` not followed by `{` is left untouched, so existing values keep working.
 _ENV_REF_PATTERN = re.compile(r"\$\$(?=\{)|\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# Default behavioral limits used when a connection's db_conn.txt does not set the
+# corresponding key. These are per-connection settings (each db_conn.txt can
+# override them); they are deliberately NOT read from the environment, so no
+# global env value ever bleeds across connections.
+_DEFAULT_SAMPLE_LIMIT = 10
+_DEFAULT_MAX_SAMPLE_LIMIT = 100
+_DEFAULT_MAX_SELECT_LIMIT = 200
+_DEFAULT_STATEMENT_TIMEOUT_MS = 5000
+
 
 def _default_conn_file_path() -> Path:
     """Return the default path to `db_conn.txt` located in the project root."""
@@ -51,8 +60,8 @@ def _expand_env_refs(key: str, value: str) -> str:
     return _ENV_REF_PATTERN.sub(_replace, value)
 
 
-def _parse_bool(value: str | None, default: bool) -> bool:
-    """Parse a boolean-like environment variable value with a fallback default."""
+def parse_bool(value: str | None, default: bool) -> bool:
+    """Parse a boolean-like config value (from db_conn.txt or env) with a default."""
     if value is None:
         return default
     normalized = value.strip().lower()
@@ -69,8 +78,25 @@ def _parse_csv(value: str | None, default: str) -> tuple[str, ...]:
     items = tuple(part.strip() for part in raw.split(",") if part.strip())
     if not items:
         raise ConfigError("invalid_config",
-                          "DB_ALLOWED_SCHEMAS cannot be empty.")
+                          "'schema' in db_conn.txt cannot be empty.")
     return items
+
+
+def _parse_int(key: str, value: str | None, default: int) -> int:
+    """Parse an integer connection-file value, or fall back to `default`.
+
+    Raises ConfigError (naming the key) on a non-integer value, so a typo in
+    db_conn.txt fails with a clear message instead of a bare ValueError.
+    """
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value.strip())
+    except ValueError as err:
+        raise ConfigError(
+            "invalid_config",
+            f"Connection field '{key}' must be an integer, got: {value!r}.",
+        ) from err
 
 
 def read_connection_file(path: Path) -> dict[str, str]:
@@ -97,7 +123,7 @@ def _resolve_adapter_class(db_dialect: str) -> type[DatabaseAdapter]:
     adapter_class = DatabaseAdapter.adapter_class_for(db_dialect)
     if adapter_class is None:
         raise ConfigError("invalid_config",
-                          f"Unsupported DB_DIALECT: {db_dialect}")
+                          f"Unsupported dialect: {db_dialect}")
     return adapter_class
 
 
@@ -131,51 +157,63 @@ class Settings:
         db_dialect: str,
         conn_values: dict[str, str],
     ) -> "Settings":
-        """Build validated settings from connection values and environment overrides."""
+        """Build validated settings from connection-file values.
+
+        Every behavioral setting (schemas, limits, timeout, system-schema toggle)
+        comes from `conn_values` (the connection's db_conn.txt) with per-setting
+        defaults. Nothing here is read from the environment: secrets are already
+        expanded into `conn_values` via `${VAR}` when the file is read, so no
+        global env value can bleed across connections.
+        """
         adapter_class = _resolve_adapter_class(db_dialect)
-        env_values = dict(os.environ)
-        env_var = getattr(adapter_class, "dsn_env_var", None) or ""
-        env_dsn = env_values.get(env_var, "").strip() if env_var else ""
-        db_dsn = env_dsn or adapter_class.build_dsn(conn_values, env_values)
+        db_dsn = adapter_class.build_dsn(conn_values)
         if not db_dsn:
-            env_label = env_var or "DB_DSN"
             raise ConfigError(
                 "invalid_config",
-                (
-                    f"{env_label} is required or db_conn.txt must contain "
-                    f"{db_dialect} connection fields."
-                ),
+                f"db_conn.txt must contain the {db_dialect} connection fields.",
             )
 
         fallback_schema = adapter_class.default_schema(conn_values)
-        fallback_schema = conn_values.get("schema", fallback_schema)
-
-        allowed_schemas = _parse_csv(
-            os.getenv("DB_ALLOWED_SCHEMAS"), fallback_schema)
-        default_sample_limit = int(os.getenv("DB_DEFAULT_SAMPLE_LIMIT", "10"))
-        max_sample_limit = int(os.getenv("DB_MAX_SAMPLE_LIMIT", "100"))
-        max_select_limit = int(os.getenv("DB_MAX_SELECT_LIMIT", "200"))
-        statement_timeout_ms = int(
-            os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000"))
-        include_system_schemas = _parse_bool(
-            os.getenv("DB_INCLUDE_SYSTEM_SCHEMAS"), False)
+        allowed_schemas = _parse_csv(conn_values.get("schema"), fallback_schema)
+        default_sample_limit = _parse_int(
+            "default_sample_limit",
+            conn_values.get("default_sample_limit"),
+            _DEFAULT_SAMPLE_LIMIT,
+        )
+        max_sample_limit = _parse_int(
+            "max_sample_limit",
+            conn_values.get("max_sample_limit"),
+            _DEFAULT_MAX_SAMPLE_LIMIT,
+        )
+        max_select_limit = _parse_int(
+            "max_select_limit",
+            conn_values.get("max_select_limit"),
+            _DEFAULT_MAX_SELECT_LIMIT,
+        )
+        statement_timeout_ms = _parse_int(
+            "statement_timeout_ms",
+            conn_values.get("statement_timeout_ms"),
+            _DEFAULT_STATEMENT_TIMEOUT_MS,
+        )
+        include_system_schemas = parse_bool(
+            conn_values.get("include_system_schemas"), False)
 
         if default_sample_limit <= 0:
             raise ConfigError("invalid_config",
-                              "DB_DEFAULT_SAMPLE_LIMIT must be > 0.")
+                              "default_sample_limit must be > 0.")
         if max_sample_limit <= 0:
             raise ConfigError("invalid_config",
-                              "DB_MAX_SAMPLE_LIMIT must be > 0.")
+                              "max_sample_limit must be > 0.")
         if max_select_limit <= 0:
             raise ConfigError("invalid_config",
-                              "DB_MAX_SELECT_LIMIT must be > 0.")
+                              "max_select_limit must be > 0.")
         if statement_timeout_ms <= 0:
             raise ConfigError("invalid_config",
-                              "DB_STATEMENT_TIMEOUT_MS must be > 0.")
+                              "statement_timeout_ms must be > 0.")
         if default_sample_limit > max_sample_limit:
             raise ConfigError(
                 "invalid_config",
-                "DB_DEFAULT_SAMPLE_LIMIT cannot be greater than DB_MAX_SAMPLE_LIMIT.",
+                "default_sample_limit cannot be greater than max_sample_limit.",
             )
 
         return Settings(
@@ -200,12 +238,11 @@ class Settings:
         db_dialect = (
             (dialect_override or "").strip().lower()
             or conn_values.get("dialect", "").strip().lower()
-            or os.getenv("DB_DIALECT", "").strip().lower()
         )
         if not db_dialect:
             raise ConfigError(
                 "invalid_config",
-                "Missing DB dialect. Provide dialect_override, 'dialect' in db_conn.txt, or DB_DIALECT.",
+                "Missing DB dialect. Provide dialect_override or 'dialect' in db_conn.txt.",
             )
         return cls._build_common(db_dialect=db_dialect, conn_values=conn_values)
 

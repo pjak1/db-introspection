@@ -46,8 +46,6 @@ def test_env_ref_expands_into_dsn(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
     monkeypatch.setenv("SECRET_USER", "env_user")
     monkeypatch.setenv("SECRET_PASS", "env_pass")
-    monkeypatch.delenv("POSTGRES_DSN", raising=False)
-    monkeypatch.delenv("DB_ALLOWED_SCHEMAS", raising=False)
 
     settings = Settings.from_env()
 

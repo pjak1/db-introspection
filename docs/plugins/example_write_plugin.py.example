@@ -29,10 +29,10 @@ def register(context: PluginContext) -> None:
     """Entry point called by the loader. Register write/DDL tools here."""
 
     def db_execute_write(connection: str, sql: str) -> dict:
-        """Execute a single write/DDL statement against an allowlisted connection.
+        """Execute a single write/DDL statement against a writable connection.
 
         `connection` is a 'project/environment/schema' key. Writes are only
-        permitted for connections listed in DB_WRITABLE_CONNECTIONS.
+        permitted for connections whose db_conn.txt sets `writable: true`.
         """
         started = time.perf_counter()
 

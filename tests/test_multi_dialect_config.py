@@ -7,30 +7,44 @@ from src.config import Settings
 from src.errors import ConfigError
 
 
-def _base_env(monkeypatch, tmp_path: Path, *, dialect: str):
+def _write_conn_file(monkeypatch, tmp_path: Path, lines: list[str]) -> None:
     conn_file = tmp_path / "db_conn.txt"
-    conn_file.write_text(f"dialect:{dialect}\n", encoding="utf-8")
+    conn_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
-    monkeypatch.delenv("POSTGRES_DSN", raising=False)
-    monkeypatch.delenv("ORACLE_DSN", raising=False)
-    monkeypatch.delenv("MSSQL_DSN", raising=False)
-    monkeypatch.delenv("DB_DIALECT", raising=False)
-    monkeypatch.setenv("DB_ALLOWED_SCHEMAS", "public")
 
 
-def test_settings_oracle_from_env(monkeypatch, tmp_path: Path):
-    _base_env(monkeypatch, tmp_path, dialect="oracle")
-    monkeypatch.setenv("ORACLE_DSN", "user/pass@localhost:1521/XEPDB1")
+def test_settings_oracle_from_conn_file(monkeypatch, tmp_path: Path):
+    _write_conn_file(
+        monkeypatch,
+        tmp_path,
+        [
+            "dialect:oracle",
+            "host:localhost",
+            "port:1521",
+            "service_name:XEPDB1",
+            "username:user",
+            "password:pass",
+            "schema:HR",
+        ],
+    )
     settings = Settings.from_env()
     assert settings.db_dialect == "oracle"
     assert settings.db_dsn == "user/pass@localhost:1521/XEPDB1"
 
 
-def test_settings_mssql_from_env(monkeypatch, tmp_path: Path):
-    _base_env(monkeypatch, tmp_path, dialect="mssql")
-    monkeypatch.setenv(
-        "MSSQL_DSN",
-        "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;DATABASE=db;UID=u;PWD=p;",
+def test_settings_mssql_from_conn_file(monkeypatch, tmp_path: Path):
+    _write_conn_file(
+        monkeypatch,
+        tmp_path,
+        [
+            "dialect:mssql",
+            "host:localhost",
+            "port:1433",
+            "db_name:db",
+            "username:u",
+            "password:p",
+            "schema:dbo",
+        ],
     )
     settings = Settings.from_env()
     assert settings.db_dialect == "mssql"
@@ -39,17 +53,25 @@ def test_settings_mssql_from_env(monkeypatch, tmp_path: Path):
 
 @pytest.mark.parametrize("alias", ["sqlserver", "sql_server", "sql-server"])
 def test_settings_mssql_aliases_are_rejected(monkeypatch, tmp_path: Path, alias: str):
-    _base_env(monkeypatch, tmp_path, dialect=alias)
-    monkeypatch.setenv(
-        "MSSQL_DSN",
-        "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;DATABASE=db;UID=u;PWD=p;",
+    _write_conn_file(
+        monkeypatch,
+        tmp_path,
+        [
+            f"dialect:{alias}",
+            "host:localhost",
+            "port:1433",
+            "db_name:db",
+            "username:u",
+            "password:p",
+            "schema:dbo",
+        ],
     )
 
     with pytest.raises(ConfigError) as exc:
         Settings.from_env()
 
     assert exc.value.code == "invalid_config"
-    assert exc.value.message == f"Unsupported DB_DIALECT: {alias}"
+    assert exc.value.message == f"Unsupported dialect: {alias}"
 
 
 def test_factory_creates_oracle_adapter():

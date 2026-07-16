@@ -14,16 +14,16 @@ server process can, at startup, and only when the steps below are all satisfied.
    copy it into this folder, e.g. `plugins/write_tools.py`. A reference
    implementation lives at [`docs/plugins/example_write_plugin.py.example`](../docs/plugins/example_write_plugin.py.example).
 2. **Enable plugin loading**: set the environment variable
-   `DB_ENABLE_WRITE_PLUGINS=1`. Without it, plugin files here are ignored.
-3. **Allow specific connections**: set `DB_WRITABLE_CONNECTIONS` to a comma-separated
-   list of canonical `project/environment/schema` keys that may be written to, e.g.
-   `DB_WRITABLE_CONNECTIONS=PROJECT_A/DEV/schema_a`. Connections not listed stay
-   strictly read-only even with a plugin loaded. An empty/unset list means nothing
-   is writable.
+   `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS=1` (a real environment variable or in the
+   project-root `.env`). Without it, plugin files here are ignored.
+3. **Mark specific connections writable**: in each connection's
+   `DB_conns/<project>/<environment>/<schema>/db_conn.txt`, add a line `writable: true`.
+   Connections without it stay strictly read-only even with a plugin loaded. This
+   keeps write permission beside the rest of that connection's configuration.
 4. **Restart the server.** Loaded plugins and registered tools are logged to stderr.
 
-Remove the plugin file (or unset `DB_ENABLE_WRITE_PLUGINS`) and restart to fully
-disable writes again.
+Remove the plugin file (or unset `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS`, or set the
+connection's `writable` back to `false`) and restart to disable writes again.
 
 ## Plugin contract
 
@@ -42,8 +42,9 @@ def register(context):
 - `connection_registry` — for connection resolution.
 - `settings_for(connection)` — resolve a connection key to `Settings` (DSN, dialect).
 - `require_writable(connection)` — **call before any write**; raises
-  `ValidationError("write_not_allowed")` unless the connection is on the allowlist.
-- `is_write_allowed(connection)` — non-raising allowlist check.
+  `ValidationError("write_not_allowed")` unless the connection's db_conn.txt sets
+  `writable: true`.
+- `is_write_allowed(connection)` — non-raising, fail-closed check of that flag.
 
 The plugin opens its own database connection from `settings.db_dsn` and is
 responsible for committing. See the example for a full, commented implementation.

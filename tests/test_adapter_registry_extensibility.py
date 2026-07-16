@@ -18,7 +18,6 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
 
     class DynamicAdapter(BaseStubAdapter):
         dialect_name = None
-        dsn_env_var = "TESTDB_DSN"
 
         def __init__(self, dsn: str):
             self._dsn = dsn
@@ -28,7 +27,7 @@ def dynamic_adapter() -> Generator[tuple[str, type[DatabaseAdapter]], None, None
             return self.dialect_name
 
         @classmethod
-        def build_dsn(cls, conn_values: dict[str, str], env: dict[str, str]) -> str:
+        def build_dsn(cls, conn_values: dict[str, str]) -> str:
             return f"testdb://{conn_values.get('username', 'user')}"
 
         @classmethod
@@ -73,9 +72,8 @@ def test_adapter_class_registers_automatically():
         DatabaseAdapter._registry.pop(dialect, None)
 
 
-def test_settings_resolve_dialect_via_registry(monkeypatch, dynamic_adapter):
+def test_settings_resolve_dialect_via_registry(dynamic_adapter):
     dialect, _ = dynamic_adapter
-    monkeypatch.delenv("DB_ALLOWED_SCHEMAS", raising=False)
     settings = Settings.from_connection_values(
         conn_values={
             "dialect": dialect,

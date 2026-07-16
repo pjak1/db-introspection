@@ -18,7 +18,6 @@ class AdapterResult:
 class DatabaseAdapter(ABC):
     """Abstract contract for DB-specific metadata and query operations."""
     dialect_name: ClassVar[str | None] = None
-    dsn_env_var: ClassVar[str | None] = None
     _registry: ClassVar[dict[str, type["DatabaseAdapter"]]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -45,8 +44,12 @@ class DatabaseAdapter(ABC):
         return DatabaseAdapter._registry.get(normalized)
 
     @classmethod
-    def build_dsn(cls, conn_values: dict[str, str], env: dict[str, str]) -> str:
-        """Build a driver-specific DSN from parsed connection and environment values."""
+    def build_dsn(cls, conn_values: dict[str, str]) -> str:
+        """Build a driver-specific DSN from parsed connection-file values.
+
+        Secrets are already resolved into `conn_values` via `${VAR}` expansion
+        when the file is read, so no environment access is needed here.
+        """
         return ""
 
     @classmethod

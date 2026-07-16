@@ -22,7 +22,6 @@ _DDL_NOT_FOUND = ("ORA-31603", "ORA-31604")
 class OracleAdapter(DatabaseAdapter):
     """Oracle implementation of the generic database adapter contract."""
     dialect_name = "oracle"
-    dsn_env_var = "ORACLE_DSN"
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use Oracle DSN."""
@@ -34,7 +33,7 @@ class OracleAdapter(DatabaseAdapter):
         return "oracle"
 
     @classmethod
-    def build_dsn(cls, conn_values: dict[str, str], env: dict[str, str]) -> str:
+    def build_dsn(cls, conn_values: dict[str, str]) -> str:
         """Build an Oracle DSN from connection-file values."""
         required = ("username", "password", "host")
         if any(key not in conn_values for key in required):

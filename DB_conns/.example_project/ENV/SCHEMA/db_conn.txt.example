@@ -5,3 +5,15 @@ port:1433
 username:${EXAMPLE_PROJECT_ENV_SCHEMA_USERNAME}
 password:${EXAMPLE_PROJECT_ENV_SCHEMA_PASSWORD}
 driver:ODBC Driver 18 for SQL Server
+
+# Allowed schemas for this connection (comma-separated). Also the whitelist
+# every tool call is validated against. Defaults to the dialect's default schema.
+# schema:schema_a,schema_b
+
+# Optional per-connection behavior (shown with their defaults). These are NOT
+# read from the environment — configure them here, per connection.
+# default_sample_limit:10
+# max_sample_limit:100
+# max_select_limit:200
+# statement_timeout_ms:5000
+# include_system_schemas:false

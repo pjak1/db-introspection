@@ -13,8 +13,35 @@ Connections must be stored under:
 - `DB_conns/PROJECT_B/DEFAULT/schema_b/db_conn.txt`
 
 Each `db_conn.txt` must contain `dialect` (`postgres|oracle|mssql`) and matching connection fields.
-If a DB user has access to multiple schemas for the same connection, you can list them in `db_conn.txt` as a comma-separated value in `schema` (for example: `schema:schema_a,schema_b,schema_c`).
+If a DB user has access to multiple schemas for the same connection, you can list them in `db_conn.txt` as a comma-separated value in `schema` (for example: `schema:schema_a,schema_b,schema_c`). The `schema` value is also the connection's `allowed_schemas` whitelist that every tool call is validated against.
 For SQL Server, the only supported dialect value is exactly `mssql` (aliases like `sqlserver`, `sql_server`, `sql-server` are not supported). The field `driver` is optional.
+
+### Per-connection behavior (optional keys)
+
+All behavioral settings are configured **per connection, in that connection's `db_conn.txt`** — never through global environment variables, so one connection's limits can never bleed into another. Each key is optional and falls back to the default below:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `default_sample_limit` | `10` | Rows returned by `db_sample_table`/`db_select_columns` when no `limit` is given. |
+| `max_sample_limit` | `100` | Hard cap for sample/select-columns `limit` (requests above it are truncated with a warning). |
+| `max_select_limit` | `200` | Hard cap for `db_run_select` result rows. |
+| `statement_timeout_ms` | `5000` | Statement timeout applied to `db_run_select`. |
+| `include_system_schemas` | `false` | Default for `db_list_tables(include_system=...)`. |
+
+Example with overrides:
+```txt
+dialect:postgres
+host:db-host.example.local
+db_name:app_db
+port:5432
+username:${APP_DEV_MAIN_USERNAME}
+password:${APP_DEV_MAIN_PASSWORD}
+schema:schema_a,schema_b
+max_select_limit:500
+statement_timeout_ms:10000
+```
+
+The environment (or `.env`) holds only DB access secrets referenced via `${VAR}` (see below) and the write-plugin master switch `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS`. No connection behavior is read from the environment.
 
 Example MSSQL `db_conn.txt`:
 ```txt
@@ -62,11 +89,11 @@ The server is **strictly read-only** by default and contains no write/DDL code. 
 Enabling writes requires four deliberate steps:
 
 1. Copy a plugin into `plugins/` (a reference implementation is at [`docs/plugins/example_write_plugin.py.example`](docs/plugins/example_write_plugin.py.example)).
-2. Set `DB_ENABLE_WRITE_PLUGINS=1` (without it, plugin files are ignored).
-3. Set `DB_WRITABLE_CONNECTIONS` to a comma-separated list of canonical `project/environment/schema` keys allowed to be written to (e.g. `PROJECT_A/DEV/schema_a`). Connections not listed stay read-only; an empty/unset list means nothing is writable.
+2. Set `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS=1` (without it, plugin files are ignored). Set it as a real environment variable or in the project-root `.env`.
+3. Mark each writable connection in its own config: add `writable: true` to that connection's `DB_conns/<project>/<environment>/<schema>/db_conn.txt`. Connections without it stay strictly read-only even with a plugin loaded.
 4. Restart the server (loaded plugins are logged to stderr).
 
-Remove the plugin file or unset `DB_ENABLE_WRITE_PLUGINS` and restart to fully disable writes again. See [`plugins/README.md`](plugins/README.md) for the plugin contract and security notes.
+Remove the plugin file or unset `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS` and restart to fully disable writes again. See [`plugins/README.md`](plugins/README.md) for the plugin contract and security notes.
 
 ## Security / threat model
 
@@ -76,7 +103,7 @@ Because this is lexical (not a full SQL parser plus execution sandbox), it **can
 
 **Recommended defense in depth:** run this server against a **least-privilege, read-only database user** (grant only `SELECT`/catalog access, no write/DDL/exec rights). That way the database itself enforces read-only regardless of what SQL reaches it, and the lexical guard is only the first layer. Do not rely on `QueryGuard` alone as a security boundary against a hostile query author.
 
-The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) is the only sanctioned way to mutate data, and even then only for connections on the `DB_WRITABLE_CONNECTIONS` allowlist.
+The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) is the only sanctioned way to mutate data, and even then only for connections whose `db_conn.txt` sets `writable: true`.
 
 ## Tool usage
 
@@ -86,7 +113,7 @@ The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) i
 - `db_list_columns(...)` now includes `full_data_type` and a `comment` column (object/column descriptions) alongside the existing raw type fields.
 - `db_list_constraints(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table", constraint_type="PRIMARY KEY")`
 - `db_list_indexes(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table")` lists indexes (uniqueness, primary-key flag, type, indexed columns); `table` is optional.
-- `db_get_ddl(connection="PROJECT_A/DEV/schema_a", schema="some_schema", object_name="some_view", object_type="view")` returns the object DDL/source as a row with a `ddl` field. `object_type` is one of `table`, `view`, `procedure`, `function`. Table DDL is only available on Oracle; on PostgreSQL/SQL Server combine `db_list_columns`, `db_list_constraints` and `db_list_indexes` for tables.
+- `db_get_ddl(connection="PROJECT_A/DEV/schema_a", schema="some_schema", object_name="some_view", object_type="view")` returns the object DDL/source as a row with a `ddl` field. `object_type` is one of `table`, `view`, `procedure`, `function`. Oracle returns authoritative DDL via `DBMS_METADATA`; on PostgreSQL and SQL Server the table DDL is reconstructed from the catalog (columns, constraints and indexes) and is flagged with a warning that it may differ slightly from the original `CREATE`.
 - `db_search_objects(connection="PROJECT_A/DEV/schema_a", schema="some_schema", pattern="usr", object_types=["table", "view"])` finds objects by case-insensitive name substring. `object_types` accepts a list or CSV string from `table`, `view`, `sequence`, `procedure`, `function` and defaults to all of them.
 - `db_list_sequences(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_procedures(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`

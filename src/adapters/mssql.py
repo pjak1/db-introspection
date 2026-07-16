@@ -17,9 +17,7 @@ from src.errors import DatabaseError, ValidationError
 class MssqlAdapter(DatabaseAdapter):
     """Microsoft SQL Server implementation of the generic adapter contract."""
     dialect_name = "mssql"
-    dsn_env_var = "MSSQL_DSN"
-    # Table DDL is not reconstructed on SQL Server; use db_list_columns/constraints/indexes.
-    ddl_object_types = ("view", "procedure", "function")
+    ddl_object_types = ("table", "view", "procedure", "function")
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use ODBC connection string."""
@@ -31,7 +29,7 @@ class MssqlAdapter(DatabaseAdapter):
         return "mssql"
 
     @classmethod
-    def build_dsn(cls, conn_values: dict[str, str], env: dict[str, str]) -> str:
+    def build_dsn(cls, conn_values: dict[str, str]) -> str:
         """Build a SQL Server ODBC DSN from connection-file values."""
         required = ("host", "db_name", "username", "password")
         if any(key not in conn_values for key in required):
@@ -498,16 +496,237 @@ class MssqlAdapter(DatabaseAdapter):
         data = self._fetch_all(query, bind)
         return AdapterResult(data=data, status="available")
 
+    @staticmethod
+    def _format_column_type(row: dict) -> str:
+        """Format a SQL Server column type with length/precision/scale."""
+        data_type = str(row.get("data_type") or "")
+        normalized = data_type.lower()
+        max_length = int_or_none(row.get("_max_length"))
+        precision = int_or_none(row.get("_precision"))
+        scale = int_or_none(row.get("_scale"))
+        if normalized in {"varchar", "char", "varbinary", "binary"} and max_length is not None:
+            size = "max" if max_length == -1 else str(max_length)
+            return f"{data_type}({size})"
+        if normalized in {"nvarchar", "nchar"} and max_length is not None:
+            size = "max" if max_length == -1 else str(max_length // 2)
+            return f"{data_type}({size})"
+        if normalized in {"decimal", "numeric"} and precision is not None:
+            return f"{data_type}({precision},{scale if scale is not None else 0})"
+        if normalized in {"datetime2", "datetimeoffset", "time"} and scale is not None:
+            return f"{data_type}({scale})"
+        return data_type
+
+    def _ddl_column_lines(self, schema: str, table: str) -> list[str]:
+        """Build the column definition lines for a reconstructed CREATE TABLE."""
+        rows = self._fetch_all(
+            """
+            SELECT
+                c.name AS name,
+                t.name AS data_type,
+                c.max_length AS _max_length,
+                c.precision AS _precision,
+                c.scale AS _scale,
+                c.is_nullable AS is_nullable,
+                c.is_identity AS is_identity,
+                CONVERT(nvarchar(64), ic.seed_value) AS seed_value,
+                CONVERT(nvarchar(64), ic.increment_value) AS increment_value,
+                dc.definition AS default_def,
+                cc.definition AS computed_def
+            FROM sys.columns c
+            JOIN sys.types t ON t.user_type_id = c.user_type_id
+            LEFT JOIN sys.identity_columns ic
+              ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+            LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
+            LEFT JOIN sys.computed_columns cc
+              ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+            WHERE c.object_id = OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?))
+            ORDER BY c.column_id
+            """,
+            (schema, table),
+        )
+        lines: list[str] = []
+        for row in rows:
+            name_q = self._q(str(row["name"]))
+            if row.get("computed_def"):
+                lines.append(f"{name_q} AS {row['computed_def']}")
+                continue
+            line = f"{name_q} {self._format_column_type(row)}"
+            if row.get("is_identity"):
+                seed = row.get("seed_value") or "1"
+                increment = row.get("increment_value") or "1"
+                line += f" IDENTITY({seed},{increment})"
+            line += " NULL" if row.get("is_nullable") else " NOT NULL"
+            if row.get("default_def"):
+                line += f" DEFAULT {row['default_def']}"
+            lines.append(line)
+        return lines
+
+    def _ddl_constraint_lines(self, schema: str, table: str) -> list[str]:
+        """Build PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK constraint lines."""
+        keys = self._fetch_all(
+            """
+            SELECT kc.name AS name, kc.type AS ctype,
+                (SELECT STRING_AGG(QUOTENAME(col.name), ', ')
+                        WITHIN GROUP (ORDER BY ic.key_ordinal)
+                 FROM sys.index_columns ic
+                 JOIN sys.columns col
+                   ON col.object_id = ic.object_id AND col.column_id = ic.column_id
+                 WHERE ic.object_id = kc.parent_object_id
+                   AND ic.index_id = kc.unique_index_id) AS cols
+            FROM sys.key_constraints kc
+            WHERE kc.parent_object_id = OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?))
+            ORDER BY kc.type DESC, kc.name
+            """,
+            (schema, table),
+        )
+        lines = [
+            f"CONSTRAINT {self._q(str(row['name']))} "
+            f"{'PRIMARY KEY' if row.get('ctype', '').strip() == 'PK' else 'UNIQUE'} "
+            f"({row['cols']})"
+            for row in keys
+        ]
+
+        fks = self._fetch_all(
+            """
+            SELECT fk.name AS name,
+                (SELECT STRING_AGG(QUOTENAME(pc.name), ', ')
+                        WITHIN GROUP (ORDER BY fkc.constraint_column_id)
+                 FROM sys.foreign_key_columns fkc
+                 JOIN sys.columns pc
+                   ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+                 WHERE fkc.constraint_object_id = fk.object_id) AS parent_cols,
+                QUOTENAME(SCHEMA_NAME(rt.schema_id)) + '.' + QUOTENAME(rt.name) AS ref_table,
+                (SELECT STRING_AGG(QUOTENAME(rc.name), ', ')
+                        WITHIN GROUP (ORDER BY fkc.constraint_column_id)
+                 FROM sys.foreign_key_columns fkc
+                 JOIN sys.columns rc
+                   ON rc.object_id = fkc.referenced_object_id
+                  AND rc.column_id = fkc.referenced_column_id
+                 WHERE fkc.constraint_object_id = fk.object_id) AS ref_cols,
+                fk.delete_referential_action_desc AS on_delete,
+                fk.update_referential_action_desc AS on_update
+            FROM sys.foreign_keys fk
+            JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+            WHERE fk.parent_object_id = OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?))
+            ORDER BY fk.name
+            """,
+            (schema, table),
+        )
+        for row in fks:
+            line = (
+                f"CONSTRAINT {self._q(str(row['name']))} FOREIGN KEY ({row['parent_cols']}) "
+                f"REFERENCES {row['ref_table']} ({row['ref_cols']})"
+            )
+            on_delete = str(row.get("on_delete") or "NO_ACTION")
+            on_update = str(row.get("on_update") or "NO_ACTION")
+            if on_delete != "NO_ACTION":
+                line += f" ON DELETE {on_delete.replace('_', ' ')}"
+            if on_update != "NO_ACTION":
+                line += f" ON UPDATE {on_update.replace('_', ' ')}"
+            lines.append(line)
+
+        checks = self._fetch_all(
+            """
+            SELECT name, definition
+            FROM sys.check_constraints
+            WHERE parent_object_id = OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?))
+            ORDER BY name
+            """,
+            (schema, table),
+        )
+        lines.extend(
+            f"CONSTRAINT {self._q(str(row['name']))} CHECK {row['definition']}"
+            for row in checks
+        )
+        return lines
+
+    def _ddl_index_statements(self, schema: str, table: str) -> list[str]:
+        """Build CREATE INDEX statements for secondary (non-constraint) indexes."""
+        rows = self._fetch_all(
+            """
+            SELECT ix.name AS name, ix.is_unique AS is_unique, ix.type_desc AS type_desc,
+                (SELECT STRING_AGG(QUOTENAME(col.name), ', ')
+                        WITHIN GROUP (ORDER BY ic.key_ordinal)
+                 FROM sys.index_columns ic
+                 JOIN sys.columns col
+                   ON col.object_id = ic.object_id AND col.column_id = ic.column_id
+                 WHERE ic.object_id = ix.object_id AND ic.index_id = ix.index_id
+                   AND ic.is_included_column = 0) AS cols,
+                (SELECT STRING_AGG(QUOTENAME(col.name), ', ')
+                        WITHIN GROUP (ORDER BY ic.index_column_id)
+                 FROM sys.index_columns ic
+                 JOIN sys.columns col
+                   ON col.object_id = ic.object_id AND col.column_id = ic.column_id
+                 WHERE ic.object_id = ix.object_id AND ic.index_id = ix.index_id
+                   AND ic.is_included_column = 1) AS included
+            FROM sys.indexes ix
+            WHERE ix.object_id = OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?))
+              AND ix.is_primary_key = 0 AND ix.is_unique_constraint = 0
+              AND ix.type > 0 AND ix.name IS NOT NULL
+            ORDER BY ix.name
+            """,
+            (schema, table),
+        )
+        table_ref = f"{self._q(schema)}.{self._q(table)}"
+        statements: list[str] = []
+        for row in rows:
+            unique = "UNIQUE " if row.get("is_unique") else ""
+            kind = str(row.get("type_desc") or "NONCLUSTERED")
+            stmt = (
+                f"CREATE {unique}{kind} INDEX {self._q(str(row['name']))} "
+                f"ON {table_ref} ({row['cols']})"
+            )
+            if row.get("included"):
+                stmt += f" INCLUDE ({row['included']})"
+            statements.append(stmt + ";")
+        return statements
+
+    def _table_ddl(self, schema: str, table: str) -> AdapterResult:
+        """Reconstruct a CREATE TABLE statement from the SQL Server catalogs.
+
+        SQL Server has no single "get table DDL" primitive (unlike Oracle's
+        DBMS_METADATA), so the statement is assembled from sys.columns,
+        sys.key_constraints/foreign_keys/check_constraints and sys.indexes. The
+        result is a faithful reconstruction, not necessarily byte-identical to the
+        original CREATE.
+        """
+        column_lines = self._ddl_column_lines(schema, table)
+        if not column_lines:
+            return AdapterResult(
+                data=[],
+                warnings=[f"No table '{schema}.{table}' found."],
+                status="not_found",
+            )
+        body_lines = column_lines + self._ddl_constraint_lines(schema, table)
+        table_ref = f"{self._q(schema)}.{self._q(table)}"
+        ddl = f"CREATE TABLE {table_ref} (\n    " + ",\n    ".join(body_lines) + "\n);"
+        for stmt in self._ddl_index_statements(schema, table):
+            ddl += f"\n{stmt}"
+        return AdapterResult(
+            data=[{
+                "object_type": "table",
+                "schema": schema,
+                "object_name": table,
+                "ddl": ddl,
+            }],
+            warnings=[
+                "Table DDL is reconstructed from the catalog and may differ from "
+                "the original CREATE statement."
+            ],
+            status="available",
+        )
+
     def get_ddl(self, schema: str, object_name: str, object_type: str) -> AdapterResult:
-        """Return the module definition of a view, procedure or function."""
+        """Return the DDL of a table, view, procedure or function."""
         normalized_type = object_type.strip().lower()
+        if normalized_type == "table":
+            return self._table_ddl(schema, object_name)
         if normalized_type not in {"view", "procedure", "function"}:
             return AdapterResult(
                 data=[],
                 warnings=[
-                    "SQL Server DDL retrieval supports object_type 'view', 'procedure' or "
-                    "'function'. For tables use db_list_columns, db_list_constraints and "
-                    "db_list_indexes."
+                    "SQL Server DDL retrieval supports object_type 'table', 'view', "
+                    "'procedure' or 'function'."
                 ],
                 status="not_supported",
             )

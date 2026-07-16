@@ -12,5 +12,5 @@ def create_adapter(settings: Settings) -> DatabaseAdapter:
     adapter_class = DatabaseAdapter.adapter_class_for(settings.db_dialect)
     if adapter_class is None:
         raise ConfigError("invalid_config",
-                          f"Unsupported DB_DIALECT: {settings.db_dialect}")
+                          f"Unsupported dialect: {settings.db_dialect}")
     return adapter_class(dsn=settings.db_dsn)

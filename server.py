@@ -55,14 +55,18 @@ def _with_services(
     return handler(introspection_service, select_service)
 
 
-def _normalize_columns(columns: Any) -> list[str]:
-    """Accept either list[str] or CSV string and normalize to list[str]."""
-    if columns is None:
+def _normalize_str_list(value: Any) -> list[str]:
+    """Accept either list[str] or CSV string and normalize to list[str].
+
+    Shared by tools that take a list-or-CSV argument (column names, object-type
+    filters).
+    """
+    if value is None:
         return []
-    if isinstance(columns, str):
-        return [item.strip() for item in columns.split(",") if item.strip()]
-    if isinstance(columns, list):
-        return columns
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return value
     return []
 
 
@@ -192,7 +196,7 @@ def db_select_columns(
         connection,
         lambda introspection_service, _: introspection_service.select_columns(
             table=table,
-            columns=_normalize_columns(columns),
+            columns=_normalize_str_list(columns),
             schema=schema,
             limit=limit,
         ),
@@ -247,9 +251,10 @@ def db_get_ddl(
 ) -> Envelope:
     """Return the DDL/source of a database object.
 
-    object_type is one of 'table', 'view', 'procedure', 'function' (table DDL is
-    only supported on Oracle; on PostgreSQL/SQL Server use db_list_columns,
-    db_list_constraints and db_list_indexes for tables).
+    object_type is one of 'table', 'view', 'procedure', 'function'. Oracle returns
+    authoritative DDL via DBMS_METADATA; on PostgreSQL and SQL Server the table
+    DDL is reconstructed from the catalog (columns, constraints and indexes) and
+    may differ slightly from the original CREATE statement.
     `connection` is a 'project/environment/schema' key from db_list_connections.
     """
     return _with_services(
@@ -281,13 +286,13 @@ def db_search_objects(
         lambda introspection_service, _: introspection_service.search_objects(
             schema=schema,
             pattern=pattern,
-            object_types=_normalize_columns(object_types) or None,
+            object_types=_normalize_str_list(object_types) or None,
         ),
     )
 
 
 if __name__ == "__main__":
-    # Load opt-in write/DDL plugins (inert unless DB_ENABLE_WRITE_PLUGINS is set
+    # Load opt-in write/DDL plugins (inert unless DB_INTROSPECTION_ENABLE_WRITE_PLUGINS is set
     # and a plugin file is manually installed in plugins/). Done here rather than
     # at import time so importing this module (e.g. in tests) never activates them.
     from src.plugins.api import PluginContext

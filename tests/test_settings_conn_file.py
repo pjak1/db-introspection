@@ -31,7 +31,7 @@ def test_settings_loads_dsn_and_schema_from_db_conn_file(monkeypatch, tmp_path: 
     assert settings.allowed_schemas == ("example_schema",)
 
 
-def test_env_schema_overrides_conn_file_schema(monkeypatch, tmp_path: Path):
+def test_schema_csv_in_conn_file_drives_allowed_schemas(monkeypatch, tmp_path: Path):
     conn_file = tmp_path / "db_conn.txt"
     conn_file.write_text(
         "\n".join(
@@ -42,17 +42,104 @@ def test_env_schema_overrides_conn_file_schema(monkeypatch, tmp_path: Path):
                 "port:5432",
                 "username:example_user",
                 "password:example_pass",
-                "schema:from_file",
+                "schema:schema_a,schema_b,schema_c",
             ]
         ),
         encoding="utf-8",
     )
     monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
-    monkeypatch.delenv("POSTGRES_DSN", raising=False)
+    # A global env value must NOT influence a per-connection setting anymore.
     monkeypatch.setenv("DB_ALLOWED_SCHEMAS", "from_env")
 
     settings = Settings.from_env()
-    assert settings.allowed_schemas == ("from_env",)
+    assert settings.allowed_schemas == ("schema_a", "schema_b", "schema_c")
+
+
+def test_per_connection_limits_read_from_conn_file(monkeypatch, tmp_path: Path):
+    conn_file = tmp_path / "db_conn.txt"
+    conn_file.write_text(
+        "\n".join(
+            [
+                "dialect:postgres",
+                "host:example-host",
+                "db_name:example_db",
+                "port:5432",
+                "username:example_user",
+                "password:example_pass",
+                "schema:example_schema",
+                "default_sample_limit:5",
+                "max_sample_limit:50",
+                "max_select_limit:500",
+                "statement_timeout_ms:10000",
+                "include_system_schemas:true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
+    # These global env vars must be ignored entirely.
+    monkeypatch.setenv("DB_MAX_SELECT_LIMIT", "1")
+    monkeypatch.setenv("DB_STATEMENT_TIMEOUT_MS", "1")
+    monkeypatch.setenv("DB_INCLUDE_SYSTEM_SCHEMAS", "false")
+
+    settings = Settings.from_env()
+    assert settings.default_sample_limit == 5
+    assert settings.max_sample_limit == 50
+    assert settings.max_select_limit == 500
+    assert settings.statement_timeout_ms == 10000
+    assert settings.include_system_schemas is True
+
+
+def test_per_connection_limits_default_when_absent(monkeypatch, tmp_path: Path):
+    conn_file = tmp_path / "db_conn.txt"
+    conn_file.write_text(
+        "\n".join(
+            [
+                "dialect:postgres",
+                "host:example-host",
+                "db_name:example_db",
+                "port:5432",
+                "username:example_user",
+                "password:example_pass",
+                "schema:example_schema",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
+
+    settings = Settings.from_env()
+    assert settings.default_sample_limit == 10
+    assert settings.max_sample_limit == 100
+    assert settings.max_select_limit == 200
+    assert settings.statement_timeout_ms == 5000
+    assert settings.include_system_schemas is False
+
+
+def test_non_integer_limit_in_conn_file_fails_fast(monkeypatch, tmp_path: Path):
+    conn_file = tmp_path / "db_conn.txt"
+    conn_file.write_text(
+        "\n".join(
+            [
+                "dialect:postgres",
+                "host:example-host",
+                "db_name:example_db",
+                "port:5432",
+                "username:example_user",
+                "password:example_pass",
+                "schema:example_schema",
+                "max_select_limit:not_a_number",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
+
+    with pytest.raises(ConfigError) as exc:
+        Settings.from_env()
+
+    assert exc.value.code == "invalid_config"
+    assert "max_select_limit" in exc.value.message
 
 
 def test_from_env_ignores_db_conn_file_env(monkeypatch, tmp_path: Path):
@@ -109,10 +196,6 @@ def test_from_env_missing_dialect_fails_fast(monkeypatch, tmp_path: Path):
         encoding="utf-8",
     )
     monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
-    monkeypatch.setenv("DB_DIALECT", "oracle")
-    monkeypatch.delenv("POSTGRES_DSN", raising=False)
-    monkeypatch.delenv("ORACLE_DSN", raising=False)
-    monkeypatch.delenv("MSSQL_DSN", raising=False)
 
     with pytest.raises(ConfigError) as exc:
         Settings.from_env()
@@ -146,7 +229,7 @@ def test_from_env_invalid_dialect_fails_fast(monkeypatch, tmp_path: Path):
         Settings.from_env()
 
     assert exc.value.code == "invalid_config"
-    assert exc.value.message == "Unsupported DB_DIALECT: unknown"
+    assert exc.value.message == "Unsupported dialect: unknown"
 
 
 def test_from_env_mssql_dialect_is_supported(monkeypatch, tmp_path: Path):
@@ -201,4 +284,4 @@ def test_from_env_mssql_aliases_are_rejected(monkeypatch, tmp_path: Path, alias:
         Settings.from_env()
 
     assert exc.value.code == "invalid_config"
-    assert exc.value.message == f"Unsupported DB_DIALECT: {alias}"
+    assert exc.value.message == f"Unsupported dialect: {alias}"
