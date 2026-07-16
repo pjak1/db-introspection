@@ -285,3 +285,23 @@ def test_from_env_mssql_aliases_are_rejected(monkeypatch, tmp_path: Path, alias:
 
     assert exc.value.code == "invalid_config"
     assert exc.value.message == f"Unsupported dialect: {alias}"
+
+
+def test_plugin_namespaced_keys_are_ignored_by_core():
+    # Plugin-owned `plugin.*` keys must never disturb core Settings, so a
+    # dropped-in plugin can add per-connection config without a core change.
+    settings = Settings.from_connection_values(
+        conn_values={
+            "dialect": "postgres",
+            "host": "example-host",
+            "db_name": "example_db",
+            "port": "5432",
+            "username": "example_user",
+            "password": "example_pass",
+            "schema": "example_schema",
+            "plugin.write.mode": "dry_run",
+        }
+    )
+
+    assert settings.db_dsn == "postgresql://example_user:example_pass@example-host:5432/example_db"
+    assert settings.allowed_schemas == ("example_schema",)

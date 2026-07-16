@@ -256,19 +256,29 @@ class MssqlAdapter(DatabaseAdapter):
         params: tuple[Any, ...] | None = None,
         timeout_ms: int | None = None,
     ) -> list[dict]:
-        """Execute SQL and return normalized rows as dictionaries."""
+        """Execute SQL and return normalized rows as dictionaries.
+
+        Read path only. SQL Server has no engine-level read-only transaction mode,
+        so read-only is enforced by never committing: the transaction is always
+        rolled back, discarding any side effect a read might have triggered (a
+        plain `with conn` would otherwise commit on exit).
+        """
+        conn = self.open_connection()
         try:
-            with self.open_connection() as conn:
-                with conn.cursor() as cur:
-                    if timeout_ms is not None:
-                        conn.timeout = max(1, int(timeout_ms) // 1000)
-                    cur.execute(query, params or ())
-                    return rows_from_cursor(cur)
+            if timeout_ms is not None:
+                conn.timeout = max(1, int(timeout_ms) // 1000)
+            with conn.cursor() as cur:
+                cur.execute(query, params or ())
+                rows = rows_from_cursor(cur)
+            conn.rollback()
+            return rows
         except DatabaseError:
             raise
         except Exception as exc:
             raise DatabaseError(
                 "database_error", "MSSQL query failed.", details=str(exc)) from exc
+        finally:
+            conn.close()
 
     @staticmethod
     def _in_clause(values: tuple[str, ...]) -> tuple[str, tuple[Any, ...]]:

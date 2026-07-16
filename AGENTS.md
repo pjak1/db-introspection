@@ -16,7 +16,7 @@ Use `db_run_select` only as a last resort (fallback) for requests that cannot be
 - Find an object by partial/unknown name: use `db_search_objects`.
 - List columns of a table: use `db_list_columns`.
 - Metadata and schema objects: use `db_list_constraints`, `db_list_indexes`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs`.
-- Read the source/definition of a view, procedure or function (tables only on Oracle): use `db_get_ddl`.
+- Read the source/definition of a view, procedure, function or table: use `db_get_ddl` (table DDL is authoritative on Oracle and reconstructed from the catalog on PostgreSQL/SQL Server).
 - Show table data preview / rows from one table: use `db_sample_table`.
 - Select specific columns from one table: use `db_select_columns`.
 - Use `db_run_select` only for advanced queries that specialized tools cannot cover:

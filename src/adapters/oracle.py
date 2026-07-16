@@ -79,7 +79,13 @@ class OracleAdapter(DatabaseAdapter):
         params: dict[str, Any] | tuple[Any, ...] | None = None,
         timeout_ms: int | None = None,
     ) -> list[dict]:
-        """Execute SQL and return normalized rows as dictionaries."""
+        """Execute SQL and return normalized rows as dictionaries.
+
+        Read path only. Defense in depth: the whole read runs inside an
+        engine-enforced read-only transaction (`SET TRANSACTION READ ONLY`, which
+        must be the first statement of the transaction), so Oracle itself rejects
+        any write regardless of what the lexical QueryGuard let through.
+        """
         try:
             with self.open_connection() as conn:
                 # python-oracledb timeout property name differs by version.
@@ -89,6 +95,7 @@ class OracleAdapter(DatabaseAdapter):
                     if hasattr(conn, "callTimeout"):
                         setattr(conn, "callTimeout", int(timeout_ms))
                 with conn.cursor() as cur:
+                    cur.execute("SET TRANSACTION READ ONLY")
                     cur.execute(query, params or {})
                     return rows_from_cursor(cur)
         except DatabaseError:

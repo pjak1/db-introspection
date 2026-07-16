@@ -11,7 +11,9 @@ from src.plugins.api import PluginContext
 # Environment flag that must be truthy for any plugin to be loaded. Defense in
 # depth on top of the manual file installation: a stray plugin file left in
 # `plugins/` does nothing unless this is explicitly enabled. May be set as a real
-# environment variable or in the project-root `.env` (loaded by src.config).
+# environment variable or in the project-root `.env` (loaded by src.config). It
+# is named for write plugins because guarding writes is why it exists, but it
+# gates loading of every plugin regardless of what the plugin does.
 ENABLE_ENV = "DB_INTROSPECTION_ENABLE_WRITE_PLUGINS"
 
 
@@ -26,7 +28,7 @@ def _default_plugins_dir(context: PluginContext) -> Path:
 
 
 def load_plugins(context: PluginContext, plugins_dir: Path | None = None) -> list[str]:
-    """Load opt-in write/DDL plugins if explicitly enabled.
+    """Load opt-in plugins if explicitly enabled.
 
     Inert by default: returns immediately unless DB_INTROSPECTION_ENABLE_WRITE_PLUGINS is truthy.
     Each `*.py` in the plugins directory is imported and its `register(context)`
@@ -54,7 +56,7 @@ def load_plugins(context: PluginContext, plugins_dir: Path | None = None) -> lis
                 continue
             register(context)
             registered.append(path.stem)
-            _log(f"loaded write plugin '{path.name}'")
+            _log(f"loaded plugin '{path.name}'")
         except Exception as exc:  # noqa: BLE001 — one bad plugin must not crash the server
             _log(f"failed to load '{path.name}': {exc!r}")
 
@@ -63,7 +65,7 @@ def load_plugins(context: PluginContext, plugins_dir: Path | None = None) -> lis
 
 def _import_module_from_path(path: Path):
     """Import a standalone module from a file path outside the src package."""
-    module_name = f"db_write_plugin_{path.stem}"
+    module_name = f"db_plugin_{path.stem}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot create import spec for {path}")

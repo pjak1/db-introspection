@@ -15,8 +15,8 @@ def normalize_connection_key(connection: str | None) -> str:
     """Canonicalize a connection key: `\\` -> `/`, collapse `//`, strip.
 
     Pure string canonicalization with no validation — the single source of truth
-    shared by the registry (which adds strict validation on top) and the write
-    plugin allowlist, so both compare identical canonical keys.
+    the registry builds its strict validation on top of, so callers always
+    compare identical canonical keys.
     """
     return re.sub(r"/+", "/", (connection or "").strip().replace("\\", "/"))
 

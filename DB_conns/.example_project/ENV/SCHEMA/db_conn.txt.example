@@ -17,3 +17,11 @@ driver:ODBC Driver 18 for SQL Server
 # max_select_limit:200
 # statement_timeout_ms:5000
 # include_system_schemas:false
+
+# Opt this connection in to writes (only effective with a write plugin installed
+# and DB_INTROSPECTION_ENABLE_WRITE_PLUGINS enabled). Core-owned, default false.
+# writable:true
+
+# Plugin-specific per-connection settings use `plugin.<name>.<key>` keys. The core
+# ignores them; the plugin reads them via plugin_config(connection, "<name>").
+# plugin.write.mode:dry_run

@@ -248,7 +248,11 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        """Create settings from the default connection file and environment values."""
+        """Create settings from the project-root default `db_conn.txt`.
+
+        The environment contributes only `${VAR}` secrets expanded while the file
+        is read; no behavioral setting is taken from the environment.
+        """
         conn_path = _default_conn_file_path()
         if not conn_path.exists():
             raise ConfigError(

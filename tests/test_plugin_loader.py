@@ -104,8 +104,8 @@ def test_missing_plugins_dir_is_noop(monkeypatch, tmp_path: Path):
     assert result == []
 
 
-def _conn_file(tmp_path: Path, writable: str | None) -> Path:
-    """Write a minimal db_conn.txt, optionally with a `writable` line."""
+def _conn_file(tmp_path: Path, writable: str | None, *extra: str) -> Path:
+    """Write a minimal db_conn.txt, optionally with `writable` and extra lines."""
     lines = [
         "dialect:postgres",
         "host:example-host",
@@ -117,6 +117,7 @@ def _conn_file(tmp_path: Path, writable: str | None) -> Path:
     ]
     if writable is not None:
         lines.append(f"writable:{writable}")
+    lines.extend(extra)
     path = tmp_path / "db_conn.txt"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -172,6 +173,53 @@ def test_unknown_connection_is_not_writable(monkeypatch):
         ctx.require_writable("PROJECT_A/DEV/schema_a")
 
     assert exc.value.code == "write_not_allowed"
+
+
+def test_connection_config_returns_all_keys(monkeypatch, tmp_path: Path):
+    conn_file = _conn_file(tmp_path, "true", "plugin.write.mode:dry_run")
+    ctx = _ctx_for_conn_file(monkeypatch, conn_file)
+
+    values = ctx.connection_config("PROJECT_A/DEV/schema_a")
+
+    assert values["writable"] == "true"
+    assert values["plugin.write.mode"] == "dry_run"
+    assert values["dialect"] == "postgres"
+
+
+def test_connection_config_raises_for_unknown_connection(monkeypatch):
+    ctx = _ctx_for_conn_file(monkeypatch, None)
+
+    with pytest.raises(ConfigError):
+        ctx.connection_config("PROJECT_A/DEV/schema_a")
+
+
+def test_plugin_config_filters_and_strips_prefix(monkeypatch, tmp_path: Path):
+    conn_file = _conn_file(
+        tmp_path,
+        "true",
+        "plugin.write.mode:dry_run",
+        "plugin.write.max_rows:100",
+        "plugin.audit.sink:stderr",
+    )
+    ctx = _ctx_for_conn_file(monkeypatch, conn_file)
+
+    assert ctx.plugin_config("PROJECT_A/DEV/schema_a", "write") == {
+        "mode": "dry_run",
+        "max_rows": "100",
+    }
+
+
+def test_plugin_config_empty_when_none(monkeypatch, tmp_path: Path):
+    ctx = _ctx_for_conn_file(monkeypatch, _conn_file(tmp_path, "true"))
+
+    assert ctx.plugin_config("PROJECT_A/DEV/schema_a", "write") == {}
+
+
+def test_plugin_config_name_is_case_insensitive(monkeypatch, tmp_path: Path):
+    conn_file = _conn_file(tmp_path, "true", "plugin.write.mode:dry_run")
+    ctx = _ctx_for_conn_file(monkeypatch, conn_file)
+
+    assert ctx.plugin_config("PROJECT_A/DEV/schema_a", "WRITE") == {"mode": "dry_run"}
 
 
 def test_settings_for_resolves_dsn(monkeypatch, tmp_path: Path):

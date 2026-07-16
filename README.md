@@ -95,13 +95,17 @@ Enabling writes requires four deliberate steps:
 
 Remove the plugin file or unset `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS` and restart to fully disable writes again. See [`plugins/README.md`](plugins/README.md) for the plugin contract and security notes.
 
+A plugin can also carry its own per-connection settings in `db_conn.txt` using `plugin.<name>.<key>` keys (for example `plugin.write.mode:dry_run`), which the core ignores and the plugin reads via `context.plugin_config(connection, "<name>")`. Flat keys (including `writable`) stay core-owned. See [`plugins/README.md`](plugins/README.md).
+
 ## Security / threat model
 
 The read-only guarantee for `db_run_select` is enforced by `QueryGuard` (`src/services/query_guard.py`), a **lexical** check: it requires the statement to start with `SELECT`/`WITH`, rejects a blocklist of write/DDL keywords, forbids multiple statements, and strips comments and string literals so keywords hidden inside them are ignored.
 
 Because this is lexical (not a full SQL parser plus execution sandbox), it **cannot see side-effecting functions** invoked from an otherwise valid `SELECT` — for example PostgreSQL `pg_sleep()`, `nextval()`, `dblink()`/`lo_export()`, Oracle `DBMS_*` packages, or SQL Server `xp_cmdshell`. A crafted `SELECT` that calls such a function passes the guard.
 
-**Recommended defense in depth:** run this server against a **least-privilege, read-only database user** (grant only `SELECT`/catalog access, no write/DDL/exec rights). That way the database itself enforces read-only regardless of what SQL reaches it, and the lexical guard is only the first layer. Do not rely on `QueryGuard` alone as a security boundary against a hostile query author.
+**Defense in depth (built in):** every read tool runs inside an engine-enforced read-only transaction where the dialect supports it — PostgreSQL (`read_only` session) and Oracle (`SET TRANSACTION READ ONLY`) reject any write outright. SQL Server has no read-only transaction mode, so reads there are never committed (always rolled back), discarding any side effect a read might have triggered.
+
+**Recommended defense in depth (operational):** additionally run this server against a **least-privilege, read-only database user** (grant only `SELECT`/catalog access, no write/DDL/exec rights). That way the database enforces read-only at the permission level too, independent of the transaction mode and the lexical guard. Do not rely on `QueryGuard` alone as a security boundary against a hostile query author.
 
 The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) is the only sanctioned way to mutate data, and even then only for connections whose `db_conn.txt` sets `writable: true`.
 
@@ -164,7 +168,7 @@ Prefer specialized tools whenever possible:
 1. `db_list_tables` for table discovery, or `db_search_objects` to locate objects by partial name across all object types.
 2. `db_list_columns` for column discovery.
 3. `db_list_constraints`, `db_list_indexes`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs` for metadata.
-4. `db_get_ddl` to read the source/definition of a view, procedure or function (and tables on Oracle).
+4. `db_get_ddl` to read the source/definition of a view, procedure, function or table (table DDL is authoritative on Oracle and reconstructed from the catalog on PostgreSQL/SQL Server).
 5. `db_sample_table` for row previews from one table.
 6. `db_select_columns` for selecting explicit columns from one table.
 7. `db_run_select` only as fallback for advanced SQL (JOIN, CTE, aggregates, complex filters, window functions).

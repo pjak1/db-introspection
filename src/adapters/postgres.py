@@ -64,9 +64,15 @@ class PostgresAdapter(DatabaseAdapter):
         params: tuple[Any, ...] | None = None,
         timeout_ms: int | None = None,
     ) -> list[dict]:
-        """Execute SQL and return normalized rows as dictionaries."""
+        """Execute SQL and return normalized rows as dictionaries.
+
+        Read path only. Defense in depth: the connection is put in an
+        engine-enforced read-only transaction, so PostgreSQL itself rejects any
+        write regardless of what the lexical QueryGuard let through.
+        """
         try:
             with self.open_connection() as conn:
+                conn.read_only = True
                 with conn.cursor(row_factory=dict_row) as cur:
                     if timeout_ms is not None:
                         cur.execute(

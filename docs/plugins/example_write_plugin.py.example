@@ -42,6 +42,17 @@ def register(context: PluginContext) -> None:
         except Exception as exc:
             return error_from_exception("unknown", started, exc)
 
+        # This plugin's own per-connection settings live under `plugin.write.*` in
+        # db_conn.txt; the core ignores them. Example: `plugin.write.mode:dry_run`.
+        cfg = context.plugin_config(connection, "write")
+        if cfg.get("mode") == "dry_run":
+            return success_envelope(
+                dialect=adapter.dialect,
+                data={"rows_affected": 0, "dry_run": True},
+                duration_ms=elapsed_ms(started),
+                status="ok",
+            )
+
         try:
             context.require_writable(connection)
             affected = _execute(adapter, sql)
