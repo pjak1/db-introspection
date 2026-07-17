@@ -1,5 +1,6 @@
 # Direct runtime dependencies (transitive deps are resolved by pip).
 # Dev/test dependencies live in requirements-dev.txt.
+keyring==25.7.0
 mcp==1.26.0
 oracledb==3.4.2
 psycopg[binary]==3.3.3

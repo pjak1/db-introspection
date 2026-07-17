@@ -6,6 +6,12 @@ username:${EXAMPLE_PROJECT_ENV_SCHEMA_USERNAME}
 password:${EXAMPLE_PROJECT_ENV_SCHEMA_PASSWORD}
 driver:ODBC Driver 18 for SQL Server
 
+# Secrets can be sourced two ways (mix freely across connections):
+#   ${VAR}             plaintext, from the environment / .env (as above)
+#   credential://NAME  encrypted at rest in the OS keychain (recommended)
+# Store keychain secrets with `python -m src.secrets set NAME`. Example:
+# password:credential://EXAMPLE_PROJECT_ENV_SCHEMA_PASSWORD
+
 # Allowed schemas for this connection (comma-separated). Also the whitelist
 # every tool call is validated against. Defaults to the dialect's default schema.
 # schema:schema_a,schema_b

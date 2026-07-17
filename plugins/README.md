@@ -83,9 +83,10 @@ cfg = context.plugin_config(connection, "write")
 ```
 
 Keys are lower-cased by the file parser (so `name` and keys are
-case-insensitive) and values support `${VAR}` env references like any other
-field. `writable` stays core-owned: gate writes with `require_writable`, not by
-reading it yourself.
+case-insensitive) and values support the same secret sources as any other field
+— `${VAR}` env references and `credential://<name>` OS-keychain lookups (see the
+main README). `writable` stays core-owned: gate writes with `require_writable`,
+not by reading it yourself.
 
 ## Security note
 

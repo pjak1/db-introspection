@@ -287,6 +287,38 @@ def test_from_env_mssql_aliases_are_rejected(monkeypatch, tmp_path: Path, alias:
     assert exc.value.message == f"Unsupported dialect: {alias}"
 
 
+def test_credential_ref_password_flows_into_dsn(monkeypatch, tmp_path: Path):
+    # A `credential://` password is resolved from the OS keychain and used just
+    # like a plaintext/`${VAR}` password when building the DSN.
+    from src.secret_store import SecretStore
+
+    class _Keyring:
+        def get_password(self, service, name):
+            return "kc_pass" if name == "PW" else None
+
+    monkeypatch.setattr(SecretStore, "_keyring", lambda self: _Keyring())
+
+    conn_file = tmp_path / "db_conn.txt"
+    conn_file.write_text(
+        "\n".join(
+            [
+                "dialect:postgres",
+                "host:example-host",
+                "db_name:example_db",
+                "port:5432",
+                "username:example_user",
+                "password:credential://PW",
+                "schema:example_schema",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("src.config._default_conn_file_path", lambda: conn_file)
+
+    settings = Settings.from_env()
+    assert settings.db_dsn == "postgresql://example_user:kc_pass@example-host:5432/example_db"
+
+
 def test_plugin_namespaced_keys_are_ignored_by_core():
     # Plugin-owned `plugin.*` keys must never disturb core Settings, so a
     # dropped-in plugin can add per-connection config without a core change.

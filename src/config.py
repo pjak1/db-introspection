@@ -10,13 +10,21 @@ from dotenv import load_dotenv
 from src.adapters.base import DatabaseAdapter
 from src.adapters.discovery import ensure_adapter_modules_loaded
 from src.errors import ConfigError
+from src.secret_store import SecretStore
+
+# Shared keychain accessor for `credential://` secret references. The `${VAR}`
+# path below is unaffected; this only adds an optional, opt-in source.
+_secret_store = SecretStore()
 
 # Load secrets from a project-root `.env` once at import time. Real environment
 # variables take precedence (override=False), and the file is optional.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-# Connection-file values may reference environment variables with `${VAR}`, so
-# secrets (username/password) can live in the environment instead of on disk.
+# Connection-file values may reference secrets two ways, so credentials never
+# need to sit in plaintext on disk:
+#   - `${VAR}`          -> expanded from the environment / .env (see below);
+#   - `credential://X`  -> read from the OS keychain via SecretStore (opt-in,
+#                          recommended). The `${VAR}` path is unchanged.
 # A literal `${...}` is written `$${...}`: the `$$` (only when it precedes `{`)
 # is the escape and collapses to a single `$` without expanding. A bare `$` or
 # `$$` not followed by `{` is left untouched, so existing values keep working.
@@ -113,7 +121,11 @@ def read_connection_file(path: Path) -> dict[str, str]:
         key = key.strip().lower()
         value = value.strip()
         if key and value:
-            values[key] = _expand_env_refs(key, value)
+            values[key] = (
+                _secret_store.resolve(key, value)
+                if _secret_store.is_secret_ref(value)
+                else _expand_env_refs(key, value)
+            )
     return values
 
 

@@ -1,5 +1,47 @@
 ﻿# db-introspection MCP server
 
+A **read-only** [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client (Codex, Claude, …) introspect and safely query **Oracle, PostgreSQL and SQL Server** databases. It exposes 14 read-only tools — list tables/columns/constraints/indexes/sequences/procedures/functions/jobs, read object DDL, search objects by name, sample rows, and run guarded `SELECT`s — across many named connections in a single process. Write/DDL is not possible unless you deliberately install an opt-in plugin (see below).
+
+## Requirements
+
+- **Python 3.10+** (developed and tested on 3.13).
+- Runtime packages from `requirements.txt` (installed below): `mcp`, `oracledb`, `psycopg[binary]`, `pyodbc`, `python-dotenv`, `keyring`.
+- **Per-dialect prerequisites:**
+  - **PostgreSQL** — nothing extra; `psycopg[binary]` bundles its own libpq.
+  - **Oracle** — nothing extra; `oracledb` runs in *thin* mode (no Oracle Client install required).
+  - **SQL Server** — an ODBC driver installed on the OS, e.g. *ODBC Driver 18 for SQL Server*; name it in each MSSQL connection's `driver:` field.
+- **Optional (recommended) encrypted secrets** use the OS-native keychain via `keyring`: Windows Credential Manager / macOS Keychain / Linux Secret Service.
+
+## Installation & setup
+
+1. **Create a virtual environment and install dependencies.**
+
+   Windows (PowerShell):
+   ```powershell
+   python -m venv venv
+   venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
+   macOS / Linux:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+   To also run the tests, add `pip install -r requirements-dev.txt`.
+
+2. **Add at least one connection.** Create `DB_conns/<project>/<environment>/<schema>/db_conn.txt` (see [Connection layout](#connection-layout)). A ready-to-copy template is at [`DB_conns/.example_project/ENV/SCHEMA/db_conn.txt.example`](DB_conns/.example_project/ENV/SCHEMA/db_conn.txt.example).
+
+3. **Provide credentials.** Inline in `db_conn.txt`, or keep them out of plaintext with `${VAR}`/`.env` or the OS keychain — see [Secrets](#secrets-via-environment-variables).
+
+4. **Register the server in your MCP client.** The client launches the server over stdio; see [Install in Codex (VS Code)](#install-in-codex-vs-code).
+
+5. **Verify.** Without any client you can smoke-test connection discovery and run the tests from the project root:
+   ```bash
+   venv/Scripts/python -c "from src.services.connection_registry import ConnectionRegistry as R; print(R().list_connections())"
+   venv/Scripts/python -m pytest -q
+   ```
+
 ## Multi-connection mode
 
 Server runs as one MCP process and switches connection at tool call time using required `connection`.
@@ -82,6 +124,30 @@ EXAMPLE_PROJECT_ENV_SCHEMA_PASSWORD=change_me
 
 Recommended variable naming: `<PROJECT>_<ENVIRONMENT>_<SCHEMA>_<FIELD>`. Real environment variables take precedence over `.env`. This is opt-in and backward compatible: values without `${...}` are still used literally, so at minimum move `password` (and ideally `username`) to `${VAR}` references.
 
+### Encrypted credentials via the OS keychain (recommended, optional)
+
+`.env` still stores secrets in plaintext. For encryption at rest — with no master password to manage — a value in `db_conn.txt` can instead reference a secret held in the **OS keychain** (Windows Credential Manager / macOS Keychain / Linux Secret Service) using a `credential://<name>` reference:
+
+```txt
+username:credential://REZA_DEV_RPP_REZA_USERNAME
+password:credential://REZA_DEV_RPP_REZA_PASSWORD
+```
+
+The secret is decrypted transparently for the current OS user at connection-read time; it never sits in any file the agent can read. This is fully opt-in — the `${VAR}`/`.env` mechanism above keeps working unchanged, and you can mix both across connections.
+
+Manage keychain secrets with the bundled CLI:
+
+```powershell
+python -m src.secrets set REZA_DEV_RPP_REZA_PASSWORD   # prompts without echo
+python -m src.secrets list
+python -m src.secrets get REZA_DEV_RPP_REZA_PASSWORD
+python -m src.secrets delete REZA_DEV_RPP_REZA_PASSWORD
+```
+
+To migrate an existing `.env`, `python -m src.secrets import-env` copies every secret from `.env` into the keychain and prints the `${VAR}` → `credential://<name>` swaps to apply in each `db_conn.txt`. It does not modify your files or delete `.env`, so the switch stays manual and reversible; remove the plaintext values from `.env` once you have verified the connections still work.
+
+If a `credential://` reference names a secret that is not stored (or the keychain is unavailable), the connection fails fast with a clear `invalid_config` error naming the field — exactly like an unset `${VAR}`.
+
 ## Write/DDL capabilities (opt-in plugin)
 
 The server is **strictly read-only** by default and contains no write/DDL code. Write and DDL capabilities can only be added by **manually installing a plugin** into the gitignored `plugins/` directory — an MCP client/agent can never do this itself.
@@ -123,10 +189,10 @@ The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) i
 - `db_list_procedures(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_functions(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_jobs(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
-- `db_sample_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema")`
-- `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema")`
+- `db_sample_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema", limit=20, order_by="id desc")` previews rows; `limit` and `order_by` are optional (`limit` defaults to `default_sample_limit` and is capped at `max_sample_limit`).
+- `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema", limit=20)`
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns="id,name", schema="some_schema")` (CSV is also supported)
-- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1")` (advanced/fallback)
+- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", limit=100, timeout_ms=8000)` (advanced/fallback); `limit` is capped at `max_select_limit` and `timeout_ms` overrides the connection's `statement_timeout_ms` for this call.
 - `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", explain=True)` returns an estimated execution plan as rows with `plan_text`.
 
 `schema` is required for introspection and table-preview tools and is always validated against `allowed_schemas` for the selected connection.
