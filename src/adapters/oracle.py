@@ -490,8 +490,9 @@ class OracleAdapter(DatabaseAdapter):
         table: str,
         limit: int,
         order_by: str | None,
+        offset: int = 0,
     ) -> AdapterResult:
-        """Return a bounded table preview with optional ORDER BY."""
+        """Return a bounded table preview with optional ORDER BY and offset."""
         schema_q = self._q(schema.upper())
         table_q = self._q(table.upper())
         query = f"SELECT * FROM {schema_q}.{table_q}"
@@ -505,7 +506,7 @@ class OracleAdapter(DatabaseAdapter):
             col_q = self._q(match.group(1).upper())
             direction = (match.group(2) or "ASC").upper()
             query += f" ORDER BY {col_q} {direction}"
-        query += f" FETCH FIRST {int(limit)} ROWS ONLY"
+        query += f" OFFSET {max(0, int(offset))} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
         data = self._fetch_all(query)
         return AdapterResult(data=data, schema_used=schema)
 
@@ -515,12 +516,16 @@ class OracleAdapter(DatabaseAdapter):
         table: str,
         columns: list[str],
         limit: int,
+        offset: int = 0,
     ) -> AdapterResult:
         """Return a bounded projection for selected table columns."""
         schema_q = self._q(schema.upper())
         table_q = self._q(table.upper())
         cols = ", ".join(self._q(column.upper()) for column in columns)
-        query = f"SELECT {cols} FROM {schema_q}.{table_q} FETCH FIRST {int(limit)} ROWS ONLY"
+        query = (
+            f"SELECT {cols} FROM {schema_q}.{table_q} "
+            f"OFFSET {max(0, int(offset))} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
+        )
         data = self._fetch_all(query)
         return AdapterResult(data=data, schema_used=schema)
 
@@ -554,3 +559,156 @@ class OracleAdapter(DatabaseAdapter):
                 "Oracle explain plan failed.",
                 details=str(exc),
             ) from exc
+
+    def table_stats(self, schema: str, table: str) -> AdapterResult:
+        """Return row-count estimate and size statistics for one table."""
+        owner = schema.upper()
+        tbl = table.upper()
+        base = self._fetch_all(
+            """
+            SELECT
+                t.owner AS schema,
+                t.table_name AS "table",
+                t.num_rows AS row_estimate,
+                (SELECT COUNT(*) FROM all_tab_columns c
+                  WHERE c.owner = t.owner AND c.table_name = t.table_name) AS column_count,
+                TO_CHAR(t.last_analyzed, 'YYYY-MM-DD"T"HH24:MI:SS') AS last_analyzed
+            FROM all_tables t
+            WHERE t.owner = :o AND t.table_name = :t
+            """,
+            {"o": owner, "t": tbl},
+        )
+        if not base:
+            return AdapterResult(
+                data=[],
+                warnings=[f"No table '{schema}.{table}' found."],
+                status="not_found",
+            )
+        row = dict(base[0])
+        warnings: list[str] = []
+        try:
+            seg = self._fetch_all(
+                """
+                SELECT
+                    SUM(CASE WHEN segment_type LIKE 'TABLE%' THEN bytes ELSE 0 END) AS table_bytes,
+                    SUM(CASE WHEN segment_type LIKE 'INDEX%' THEN bytes ELSE 0 END) AS index_bytes,
+                    SUM(bytes) AS total_bytes
+                FROM dba_segments
+                WHERE owner = :o
+                  AND (segment_name = :t
+                       OR segment_name IN (SELECT index_name FROM all_indexes
+                                            WHERE table_owner = :o AND table_name = :t))
+                """,
+                {"o": owner, "t": tbl},
+            )
+            row.update(seg[0] if seg else {})
+        except DatabaseError as exc:
+            details = str(exc.details or "")
+            if any(code in details for code in ("ORA-00942", "ORA-01031")):
+                row.update({"table_bytes": None, "index_bytes": None, "total_bytes": None})
+                warnings.append(
+                    "Oracle segment sizes require access to DBA_SEGMENTS; sizes omitted."
+                )
+            else:
+                raise
+        return AdapterResult(data=[row], warnings=warnings, status="available")
+
+    def list_foreign_keys(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List foreign-key edges for the selected schemas, optionally for one table."""
+        in_clause, params = self._schema_params(schemas)
+        params["table_name"] = table.upper() if table else None
+        query = f"""
+            SELECT
+                c.constraint_name,
+                c.owner AS schema,
+                c.table_name AS "table",
+                LISTAGG(col.column_name, ', ')
+                    WITHIN GROUP (ORDER BY col.position) AS columns,
+                r.owner AS ref_schema,
+                r.table_name AS ref_table,
+                LISTAGG(rcol.column_name, ', ')
+                    WITHIN GROUP (ORDER BY rcol.position) AS ref_columns,
+                c.delete_rule AS on_delete,
+                CAST(NULL AS VARCHAR2(20)) AS on_update
+            FROM all_constraints c
+            JOIN all_cons_columns col
+              ON c.owner = col.owner AND c.constraint_name = col.constraint_name
+            JOIN all_constraints r
+              ON c.r_owner = r.owner AND c.r_constraint_name = r.constraint_name
+            LEFT JOIN all_cons_columns rcol
+              ON r.owner = rcol.owner AND r.constraint_name = rcol.constraint_name
+             AND rcol.position = col.position
+            WHERE c.constraint_type = 'R'
+              AND c.owner IN ({in_clause})
+              AND (:table_name IS NULL OR c.table_name = :table_name OR r.table_name = :table_name)
+            GROUP BY c.constraint_name, c.owner, c.table_name,
+                     r.owner, r.table_name, c.delete_rule
+            ORDER BY c.owner, c.table_name, c.constraint_name
+        """
+        data = self._fetch_all(query, params)
+        return AdapterResult(data=data, status="available")
+
+    def top_queries(self, limit: int) -> AdapterResult:
+        """Return the slowest queries by elapsed time (v$sqlstats)."""
+        query = """
+            SELECT * FROM (
+                SELECT
+                    sql_id AS query_id,
+                    sql_text AS query,
+                    executions AS calls,
+                    ROUND(elapsed_time / 1000, 2) AS total_ms,
+                    ROUND(elapsed_time / 1000 / NULLIF(executions, 0), 2) AS mean_ms,
+                    rows_processed AS "rows"
+                FROM v$sqlstats
+                ORDER BY elapsed_time DESC
+            ) WHERE ROWNUM <= :lim
+        """
+        try:
+            data = self._fetch_all(query, {"lim": int(limit)})
+        except DatabaseError as exc:
+            details = str(exc.details or "")
+            return degraded_or_raise(
+                exc,
+                matched=any(code in details for code in ("ORA-00942", "ORA-01031")),
+                warning=(
+                    "Oracle V$SQLSTATS requires SELECT_CATALOG_ROLE (or SELECT on "
+                    "v$ views); top queries are unavailable for this user."
+                ),
+            )
+        return AdapterResult(data=data, status="available")
+
+    def health_check(self) -> AdapterResult:
+        """Run a pragmatic set of Oracle health checks, each degrading alone."""
+        checks: list[tuple[str, str, str]] = [
+            (
+                "invalid_objects",
+                "SELECT COUNT(*) AS v FROM all_objects WHERE status = 'INVALID'",
+                "objects in INVALID state (need recompile).",
+            ),
+            (
+                "unusable_indexes",
+                "SELECT COUNT(*) AS v FROM all_indexes WHERE status = 'UNUSABLE'",
+                "indexes in UNUSABLE state.",
+            ),
+            (
+                "disabled_constraints",
+                "SELECT COUNT(*) AS v FROM all_constraints WHERE status = 'DISABLED'",
+                "constraints currently disabled.",
+            ),
+            (
+                "stale_statistics",
+                "SELECT COUNT(*) AS v FROM all_tab_statistics WHERE stale_stats = 'YES'",
+                "tables with stale optimizer statistics.",
+            ),
+        ]
+        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        return AdapterResult(data=rows, status="available")
+
+    def _run_health_check(self, name: str, sql: str, detail: str) -> dict:
+        """Execute one health-check query, returning a normalized result row."""
+        try:
+            result = self._fetch_all(sql)
+        except DatabaseError as exc:
+            return {"check": name, "status": "unknown", "detail": str(exc.details or exc.message)}
+        value = result[0].get("v") if result else None
+        return {"check": name, "status": "ok", "value": value, "detail": detail}

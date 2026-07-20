@@ -16,9 +16,12 @@ Use `db_run_select` only as a last resort (fallback) for requests that cannot be
 - Find an object by partial/unknown name: use `db_search_objects`.
 - List columns of a table: use `db_list_columns`.
 - Metadata and schema objects: use `db_list_constraints`, `db_list_indexes`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs`.
+- Foreign-key relationships / how tables relate / dependency direction: use `db_list_foreign_keys`.
+- Table size / row-count / column-count questions: use `db_table_stats`.
 - Read the source/definition of a view, procedure, function or table: use `db_get_ddl` (table DDL is authoritative on Oracle and reconstructed from the catalog on PostgreSQL/SQL Server).
-- Show table data preview / rows from one table: use `db_sample_table`.
+- Show table data preview / rows from one table: use `db_sample_table` (supports `offset` paging and `format` csv/json).
 - Select specific columns from one table: use `db_select_columns`.
+- Performance / slow queries / database health: use `db_top_queries` and `db_health_check` (results depend on the DB user's catalog/DMV privileges).
 - Use `db_run_select` only for advanced queries that specialized tools cannot cover:
   - joins across tables
   - CTE queries

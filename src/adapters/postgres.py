@@ -535,13 +535,13 @@ class PostgresAdapter(DatabaseAdapter):
         table: str,
         limit: int,
         order_by: str | None,
+        offset: int = 0,
     ) -> AdapterResult:
-        """Return a bounded table preview with optional ORDER BY."""
+        """Return a bounded table preview with optional ORDER BY and offset."""
         base_query = sql.SQL("SELECT * FROM {}.{}").format(
             sql.Identifier(schema),
             sql.Identifier(table),
         )
-        params: list[Any] = [limit]
 
         if order_by:
             match = ORDER_BY_RE.match(order_by)
@@ -557,8 +557,8 @@ class PostgresAdapter(DatabaseAdapter):
                 sql.SQL(direction),
             )
 
-        base_query += sql.SQL(" LIMIT %s")
-        data = self._fetch_all(base_query, tuple(params))
+        base_query += sql.SQL(" LIMIT %s OFFSET %s")
+        data = self._fetch_all(base_query, (limit, max(0, int(offset))))
         return AdapterResult(data=data, schema_used=schema)
 
     def select_columns(
@@ -567,14 +567,15 @@ class PostgresAdapter(DatabaseAdapter):
         table: str,
         columns: list[str],
         limit: int,
+        offset: int = 0,
     ) -> AdapterResult:
         """Return a bounded projection for selected table columns."""
-        query = sql.SQL("SELECT {} FROM {}.{} LIMIT %s").format(
+        query = sql.SQL("SELECT {} FROM {}.{} LIMIT %s OFFSET %s").format(
             sql.SQL(", ").join(sql.Identifier(column) for column in columns),
             sql.Identifier(schema),
             sql.Identifier(table),
         )
-        data = self._fetch_all(query, (limit,))
+        data = self._fetch_all(query, (limit, max(0, int(offset))))
         return AdapterResult(data=data, schema_used=schema)
 
     def run_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
@@ -592,3 +593,151 @@ class PostgresAdapter(DatabaseAdapter):
             data=self._normalize_explain_rows(data),
             status="explain",
         )
+
+    def table_stats(self, schema: str, table: str) -> AdapterResult:
+        """Return row-count estimate and size statistics for one table."""
+        query = """
+            SELECT
+                n.nspname AS schema,
+                c.relname AS "table",
+                CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END AS row_estimate,
+                pg_table_size(c.oid) AS table_bytes,
+                pg_indexes_size(c.oid) AS index_bytes,
+                pg_total_relation_size(c.oid) AS total_bytes,
+                (SELECT count(*) FROM information_schema.columns col
+                  WHERE col.table_schema = n.nspname AND col.table_name = c.relname) AS column_count,
+                to_char(GREATEST(s.last_analyze, s.last_autoanalyze),
+                        'YYYY-MM-DD"T"HH24:MI:SS') AS last_analyzed
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_catalog.pg_stat_all_tables s ON s.relid = c.oid
+            WHERE n.nspname = %s AND c.relname = %s
+              AND c.relkind IN ('r', 'p', 'f', 'm')
+        """
+        data = self._fetch_all(query, (schema, table))
+        if not data:
+            return AdapterResult(
+                data=[],
+                warnings=[f"No table '{schema}.{table}' found."],
+                status="not_found",
+            )
+        return AdapterResult(data=data, status="available")
+
+    def list_foreign_keys(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List foreign-key edges for the selected schemas, optionally for one table."""
+        action = (
+            "CASE {col} WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' "
+            "WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' "
+            "WHEN 'd' THEN 'SET DEFAULT' END"
+        )
+        query = f"""
+            SELECT
+                con.conname AS constraint_name,
+                n.nspname AS schema,
+                c.relname AS "table",
+                (SELECT string_agg(a.attname, ', ' ORDER BY u.ord)
+                   FROM unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord)
+                   JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid = con.conrelid AND a.attnum = u.attnum) AS columns,
+                rn.nspname AS ref_schema,
+                rc.relname AS ref_table,
+                (SELECT string_agg(a.attname, ', ' ORDER BY u.ord)
+                   FROM unnest(con.confkey) WITH ORDINALITY AS u(attnum, ord)
+                   JOIN pg_catalog.pg_attribute a
+                     ON a.attrelid = con.confrelid AND a.attnum = u.attnum) AS ref_columns,
+                {action.format(col="con.confdeltype")} AS on_delete,
+                {action.format(col="con.confupdtype")} AS on_update
+            FROM pg_catalog.pg_constraint con
+            JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid
+            JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
+            WHERE con.contype = 'f'
+              AND n.nspname = ANY(%s)
+        """
+        params: list[Any] = [list(schemas)]
+        normalized_table = table.strip() if isinstance(table, str) else None
+        if normalized_table:
+            query += "\n  AND (c.relname = %s OR rc.relname = %s)"
+            params.extend([normalized_table, normalized_table])
+        query += "\n            ORDER BY n.nspname, c.relname, con.conname"
+        data = self._fetch_all(query, tuple(params))
+        return AdapterResult(data=data, status="available")
+
+    def top_queries(self, limit: int) -> AdapterResult:
+        """Return the slowest queries by total execution time (pg_stat_statements)."""
+        query = """
+            SELECT
+                queryid AS query_id,
+                query,
+                calls,
+                round(total_exec_time::numeric, 2) AS total_ms,
+                round(mean_exec_time::numeric, 2) AS mean_ms,
+                rows
+            FROM pg_stat_statements
+            ORDER BY total_exec_time DESC
+            LIMIT %s
+        """
+        try:
+            data = self._fetch_all(query, (int(limit),))
+        except DatabaseError as exc:
+            details = str(exc.details or "").lower()
+            matched = any(
+                fragment in details
+                for fragment in ("pg_stat_statements", "total_exec_time", "permission denied")
+            )
+            return degraded_or_raise(
+                exc,
+                matched=matched,
+                warning=(
+                    "pg_stat_statements is not installed or not accessible for this "
+                    "user; top queries are unavailable."
+                ),
+            )
+        return AdapterResult(data=data, status="available")
+
+    def health_check(self) -> AdapterResult:
+        """Run a pragmatic set of PostgreSQL health checks, each degrading alone."""
+        checks: list[tuple[str, str, str]] = [
+            (
+                "cache_hit_ratio",
+                """SELECT round(sum(blks_hit) * 100.0
+                          / nullif(sum(blks_hit + blks_read), 0), 2) AS v
+                   FROM pg_stat_database WHERE datname = current_database()""",
+                "%% buffer cache hit ratio (higher is better).",
+            ),
+            (
+                "unused_indexes",
+                "SELECT count(*) AS v FROM pg_stat_user_indexes WHERE idx_scan = 0",
+                "indexes never used since stats reset.",
+            ),
+            (
+                "invalid_indexes",
+                "SELECT count(*) AS v FROM pg_index WHERE indisvalid = false",
+                "invalid indexes (failed CONCURRENTLY builds).",
+            ),
+            (
+                "tables_needing_vacuum",
+                "SELECT count(*) AS v FROM pg_stat_user_tables WHERE n_dead_tup > 10000",
+                "tables with > 10k dead tuples.",
+            ),
+            (
+                "connection_usage",
+                """SELECT round(count(*) * 100.0
+                          / nullif((SELECT setting::int FROM pg_settings
+                                    WHERE name = 'max_connections'), 0), 1) AS v
+                   FROM pg_stat_activity""",
+                "%% of max_connections in use.",
+            ),
+        ]
+        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        return AdapterResult(data=rows, status="available")
+
+    def _run_health_check(self, name: str, sql: str, detail: str) -> dict:
+        """Execute one health-check query, returning a normalized result row."""
+        try:
+            result = self._fetch_all(sql)
+        except DatabaseError as exc:
+            return {"check": name, "status": "unknown", "detail": str(exc.details or exc.message)}
+        value = result[0].get("v") if result else None
+        return {"check": name, "status": "ok", "value": value, "detail": detail}

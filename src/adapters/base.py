@@ -156,8 +156,12 @@ class DatabaseAdapter(ABC):
         table: str,
         limit: int,
         order_by: str | None,
+        offset: int = 0,
     ) -> AdapterResult:
-        """Return a bounded preview of rows from a single table."""
+        """Return a bounded preview of rows from a single table.
+
+        `offset` skips that many leading rows for pagination (0 = first page).
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -167,8 +171,12 @@ class DatabaseAdapter(ABC):
         table: str,
         columns: list[str],
         limit: int,
+        offset: int = 0,
     ) -> AdapterResult:
-        """Return a bounded projection of selected columns from a single table."""
+        """Return a bounded projection of selected columns from a single table.
+
+        `offset` skips that many leading rows for pagination (0 = first page).
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -179,4 +187,44 @@ class DatabaseAdapter(ABC):
     @abstractmethod
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         """Return an estimated execution plan for a validated read-only SQL query."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def table_stats(self, schema: str, table: str) -> AdapterResult:
+        """Return size/row-count statistics for a single table.
+
+        Row shape: schema, table, row_estimate (from catalog statistics, may be
+        stale), table_bytes, index_bytes, total_bytes, column_count,
+        last_analyzed. Byte columns may be None when the connection lacks access
+        to the size catalogs (degrade with a warning, never fail).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_foreign_keys(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List foreign-key edges within the schema scope.
+
+        Row shape: constraint_name, schema, table, columns, ref_schema,
+        ref_table, ref_columns, on_delete, on_update. When `table` is given it
+        matches either side (referencing or referenced), so callers can ask both
+        "what does X reference?" and "what references X?".
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def top_queries(self, limit: int) -> AdapterResult:
+        """Return the most resource-intensive queries known to the engine.
+
+        Privilege/extension sensitive (pg_stat_statements / v$sqlstats /
+        sys.dm_exec_query_stats); degrade with a warning when unavailable.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def health_check(self) -> AdapterResult:
+        """Return a list of health-check rows: check, status, detail.
+
+        Each check degrades independently to status 'unknown' with a detail note
+        when the required catalog/DMV access is missing.
+        """
         raise NotImplementedError

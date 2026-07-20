@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.adapters.base import DatabaseAdapter
 from src.config import Settings
+from src.services.export import normalize_output_format, serialize_rows
 from src.services.response import Ok, service_operation
 from src.services.query_guard import QueryGuard
 
@@ -25,8 +26,10 @@ class SelectService:
         limit: int | None,
         timeout_ms: int | None,
         explain: bool = False,
+        output_format: str | None = None,
     ) -> Ok:
         """Run a validated read-only query with bounded result size and timeout."""
+        fmt = normalize_output_format(output_format)
         applied_timeout = (
             self._settings.statement_timeout_ms
             if timeout_ms is None
@@ -51,4 +54,11 @@ class SelectService:
             sql_query=guarded.sql,
             timeout_ms=applied_timeout,
         )
-        return Ok(result, truncated=guarded.truncated, extra_warnings=guarded.warnings)
+        warnings = list(guarded.warnings)
+        if fmt != "rows":
+            original = result.data
+            row_count = len(original) if isinstance(original, list) else None
+            result.data = serialize_rows(original, fmt)
+            suffix = f" ({row_count} rows)." if row_count is not None else "."
+            warnings.append(f"Rows serialized as {fmt}{suffix}")
+        return Ok(result, truncated=guarded.truncated, extra_warnings=warnings)

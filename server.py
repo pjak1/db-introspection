@@ -170,8 +170,15 @@ def db_sample_table(
     table: str = "",
     limit: int | None = None,
     order_by: str | None = None,
+    offset: int | None = None,
+    format: str = "rows",
 ) -> Envelope:
-    """Return a bounded preview of table rows with optional ordering."""
+    """Return a bounded preview of table rows with optional ordering.
+
+    `offset` skips leading rows for pagination (pair with `order_by` for stable
+    pages). `format` is 'rows' (default), 'csv' or 'json' — csv/json return the
+    result serialized as a string.
+    """
     return _with_services(
         connection,
         lambda introspection_service, _: introspection_service.sample_table(
@@ -179,6 +186,8 @@ def db_sample_table(
             schema=schema,
             limit=limit,
             order_by=order_by,
+            offset=offset,
+            output_format=format,
         ),
     )
 
@@ -190,8 +199,14 @@ def db_select_columns(
     table: str = "",
     columns: Any = None,
     limit: int | None = None,
+    offset: int | None = None,
+    format: str = "rows",
 ) -> Envelope:
-    """Return rows from a table restricted to selected columns."""
+    """Return rows from a table restricted to selected columns.
+
+    `offset` skips leading rows for pagination. `format` is 'rows' (default),
+    'csv' or 'json' — csv/json return the result serialized as a string.
+    """
     return _with_services(
         connection,
         lambda introspection_service, _: introspection_service.select_columns(
@@ -199,6 +214,8 @@ def db_select_columns(
             columns=_normalize_str_list(columns),
             schema=schema,
             limit=limit,
+            offset=offset,
+            output_format=format,
         ),
     )
 
@@ -210,9 +227,12 @@ def db_run_select(
     limit: int | None = None,
     timeout_ms: int | None = None,
     explain: bool = False,
+    format: str = "rows",
 ) -> Envelope:
     """Run a guarded read-only SELECT query or return its estimated plan.
 
+    `format` is 'rows' (default), 'csv' or 'json' — csv/json return the result
+    serialized as a string. For paging, put OFFSET/FETCH in your own SQL.
     `connection` is a 'project/environment/schema' key from db_list_connections.
     """
     return _with_services(
@@ -222,6 +242,7 @@ def db_run_select(
             limit=limit,
             timeout_ms=timeout_ms,
             explain=explain,
+            output_format=format,
         ),
     )
 
@@ -288,6 +309,73 @@ def db_search_objects(
             pattern=pattern,
             object_types=_normalize_str_list(object_types) or None,
         ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_table_stats(connection: str, schema: str, table: str) -> Envelope:
+    """Return row-count estimate and size statistics for a single table.
+
+    Data row: row_estimate (from catalog statistics, may be stale), table_bytes,
+    index_bytes, total_bytes, column_count, last_analyzed. Byte fields may be null
+    when the connection lacks access to the size catalogs (reported as a warning).
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.table_stats(
+            schema=schema,
+            table=table,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_list_foreign_keys(connection: str, schema: str, table: str | None = None) -> Envelope:
+    """List foreign-key relationships (edges) in the allowed schema scope.
+
+    Each row: constraint_name, schema, table, columns, ref_schema, ref_table,
+    ref_columns, on_delete, on_update. When `table` is given it matches either
+    side, so you can ask both what a table references and what references it.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.list_foreign_keys(
+            schema=schema,
+            table=table,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_top_queries(connection: str, limit: int | None = None) -> Envelope:
+    """Return the most resource-intensive queries recorded by the engine.
+
+    Ordered by total execution time. Requires engine query-stats access
+    (pg_stat_statements / V$SQLSTATS / query-stats DMVs); when unavailable the
+    result is empty with an explanatory warning rather than an error.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.top_queries(limit=limit),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_health_check(connection: str) -> Envelope:
+    """Run database health checks and return one row per check.
+
+    Each row: check, status ('ok' or 'unknown'), value, detail. Checks are
+    dialect-specific and degrade independently to 'unknown' when the required
+    catalog access is missing, so partial results are expected under a
+    least-privilege user.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.health_check(),
     )
 
 

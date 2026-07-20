@@ -5,7 +5,7 @@ from src.services.introspection_service import IntrospectionService
 
 
 class DummyAdapter(BaseStubAdapter):
-    def select_columns(self, schema, table, columns, limit) -> AdapterResult:
+    def select_columns(self, schema, table, columns, limit, offset=0) -> AdapterResult:
         return AdapterResult(
             data=[{column: f"v_{column}" for column in columns}],
             schema_used=schema,

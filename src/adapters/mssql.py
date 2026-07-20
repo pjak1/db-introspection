@@ -804,11 +804,13 @@ class MssqlAdapter(DatabaseAdapter):
         table: str,
         limit: int,
         order_by: str | None,
+        offset: int = 0,
     ) -> AdapterResult:
-        """Return a bounded table preview with optional ORDER BY."""
+        """Return a bounded table preview with optional ORDER BY and offset."""
         schema_q = self._q(schema)
         table_q = self._q(table)
-        query = f"SELECT TOP ({int(limit)}) * FROM {schema_q}.{table_q}"
+        off = max(0, int(offset))
+        order_clause = ""
         if order_by:
             match = ORDER_BY_RE.match(order_by)
             if not match:
@@ -818,7 +820,16 @@ class MssqlAdapter(DatabaseAdapter):
                 )
             col = self._q(match.group(1))
             direction = (match.group(2) or "ASC").upper()
-            query += f" ORDER BY {col} {direction}"
+            order_clause = f" ORDER BY {col} {direction}"
+        if off > 0:
+            # OFFSET/FETCH requires an ORDER BY; add a no-op one when unordered.
+            order_clause = order_clause or " ORDER BY (SELECT NULL)"
+            query = (
+                f"SELECT * FROM {schema_q}.{table_q}{order_clause} "
+                f"OFFSET {off} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
+            )
+        else:
+            query = f"SELECT TOP ({int(limit)}) * FROM {schema_q}.{table_q}{order_clause}"
         data = self._fetch_all(query)
         return AdapterResult(data=data, schema_used=schema)
 
@@ -828,12 +839,20 @@ class MssqlAdapter(DatabaseAdapter):
         table: str,
         columns: list[str],
         limit: int,
+        offset: int = 0,
     ) -> AdapterResult:
         """Return a bounded projection for selected table columns."""
         schema_q = self._q(schema)
         table_q = self._q(table)
         cols = ", ".join(self._q(column) for column in columns)
-        query = f"SELECT TOP ({int(limit)}) {cols} FROM {schema_q}.{table_q}"
+        off = max(0, int(offset))
+        if off > 0:
+            query = (
+                f"SELECT {cols} FROM {schema_q}.{table_q} "
+                f"ORDER BY (SELECT NULL) OFFSET {off} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
+            )
+        else:
+            query = f"SELECT TOP ({int(limit)}) {cols} FROM {schema_q}.{table_q}"
         data = self._fetch_all(query)
         return AdapterResult(data=data, schema_used=schema)
 
@@ -879,3 +898,148 @@ class MssqlAdapter(DatabaseAdapter):
                 "MSSQL explain plan failed.",
                 details=str(exc),
             ) from exc
+
+    def table_stats(self, schema: str, table: str) -> AdapterResult:
+        """Return row-count estimate and size statistics for one table.
+
+        Uses the catalog views (sys.partitions/allocation_units), which are
+        visible under ordinary metadata permissions, so no VIEW DATABASE STATE
+        grant is required.
+        """
+        query = """
+            SELECT
+                SCHEMA_NAME(t.schema_id) AS [schema],
+                t.name AS [table],
+                SUM(CASE WHEN p.index_id IN (0, 1) THEN p.rows ELSE 0 END) AS row_estimate,
+                SUM(CASE WHEN p.index_id IN (0, 1) THEN a.used_pages ELSE 0 END) * 8 * 1024 AS table_bytes,
+                SUM(CASE WHEN p.index_id NOT IN (0, 1) THEN a.used_pages ELSE 0 END) * 8 * 1024 AS index_bytes,
+                SUM(a.total_pages) * 8 * 1024 AS total_bytes,
+                (SELECT COUNT(*) FROM sys.columns c WHERE c.object_id = t.object_id) AS column_count,
+                CONVERT(varchar(19), STATS_DATE(t.object_id,
+                    (SELECT MIN(s.stats_id) FROM sys.stats s WHERE s.object_id = t.object_id)), 126)
+                    AS last_analyzed
+            FROM sys.tables t
+            JOIN sys.partitions p ON p.object_id = t.object_id
+            JOIN sys.allocation_units a ON a.container_id = p.partition_id
+            WHERE SCHEMA_NAME(t.schema_id) = ? AND t.name = ?
+            GROUP BY SCHEMA_NAME(t.schema_id), t.name, t.object_id
+        """
+        data = self._fetch_all(query, (schema, table))
+        if not data:
+            return AdapterResult(
+                data=[],
+                warnings=[f"No table '{schema}.{table}' found."],
+                status="not_found",
+            )
+        return AdapterResult(data=data, status="available")
+
+    def list_foreign_keys(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
+        """List foreign-key edges for the selected schemas, optionally for one table."""
+        in_clause, params = self._in_clause(schemas)
+        query = f"""
+            SELECT
+                fk.name AS constraint_name,
+                SCHEMA_NAME(pt.schema_id) AS [schema],
+                pt.name AS [table],
+                (SELECT STRING_AGG(pc.name, ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id)
+                 FROM sys.foreign_key_columns fkc
+                 JOIN sys.columns pc
+                   ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+                 WHERE fkc.constraint_object_id = fk.object_id) AS columns,
+                SCHEMA_NAME(rt.schema_id) AS ref_schema,
+                rt.name AS ref_table,
+                (SELECT STRING_AGG(rc.name, ', ') WITHIN GROUP (ORDER BY fkc.constraint_column_id)
+                 FROM sys.foreign_key_columns fkc
+                 JOIN sys.columns rc
+                   ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+                 WHERE fkc.constraint_object_id = fk.object_id) AS ref_columns,
+                REPLACE(fk.delete_referential_action_desc, '_', ' ') AS on_delete,
+                REPLACE(fk.update_referential_action_desc, '_', ' ') AS on_update
+            FROM sys.foreign_keys fk
+            JOIN sys.tables pt ON pt.object_id = fk.parent_object_id
+            JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+            WHERE SCHEMA_NAME(pt.schema_id) IN ({in_clause})
+              AND (? IS NULL OR pt.name = ? OR rt.name = ?)
+            ORDER BY [schema], [table], fk.name
+        """
+        normalized_table = table.strip() if isinstance(table, str) else None
+        bind = params + (normalized_table, normalized_table, normalized_table)
+        data = self._fetch_all(query, bind)
+        return AdapterResult(data=data, status="available")
+
+    def top_queries(self, limit: int) -> AdapterResult:
+        """Return the slowest queries by total elapsed time (dm_exec_query_stats)."""
+        query = """
+            SELECT TOP (?)
+                CONVERT(varchar(34), qs.query_hash, 1) AS query_id,
+                SUBSTRING(st.text, 1, 1000) AS query,
+                qs.execution_count AS calls,
+                CAST(qs.total_elapsed_time / 1000.0 AS decimal(18, 2)) AS total_ms,
+                CAST(qs.total_elapsed_time / 1000.0
+                     / NULLIF(qs.execution_count, 0) AS decimal(18, 2)) AS mean_ms,
+                qs.total_rows AS [rows]
+            FROM sys.dm_exec_query_stats qs
+            CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+            ORDER BY qs.total_elapsed_time DESC
+        """
+        try:
+            data = self._fetch_all(query, (int(limit),))
+        except DatabaseError as exc:
+            details = str(exc.details or "").lower()
+            matched = (
+                "permission" in details
+                or "denied" in details
+                or "(297)" in details
+                or "view server state" in details
+            )
+            return degraded_or_raise(
+                exc,
+                matched=matched,
+                warning=(
+                    "SQL Server query-stats DMVs require VIEW SERVER STATE; top "
+                    "queries are unavailable for this user."
+                ),
+            )
+        return AdapterResult(data=data, status="available")
+
+    def health_check(self) -> AdapterResult:
+        """Run a pragmatic set of SQL Server health checks, each degrading alone.
+
+        Uses catalog views only (no VIEW SERVER STATE), so it works for a
+        least-privilege user; DMV-based checks are intentionally omitted.
+        """
+        checks: list[tuple[str, str, str]] = [
+            (
+                "disabled_indexes",
+                "SELECT COUNT(*) AS v FROM sys.indexes WHERE is_disabled = 1",
+                "indexes currently disabled.",
+            ),
+            (
+                "untrusted_foreign_keys",
+                "SELECT COUNT(*) AS v FROM sys.foreign_keys WHERE is_not_trusted = 1",
+                "foreign keys not trusted by the optimizer.",
+            ),
+            (
+                "untrusted_check_constraints",
+                "SELECT COUNT(*) AS v FROM sys.check_constraints WHERE is_not_trusted = 1",
+                "check constraints not trusted by the optimizer.",
+            ),
+            (
+                "heap_tables",
+                """SELECT COUNT(*) AS v FROM sys.tables t
+                   WHERE NOT EXISTS (SELECT 1 FROM sys.indexes i
+                                     WHERE i.object_id = t.object_id AND i.index_id = 1)""",
+                "tables stored as heaps (no clustered index).",
+            ),
+        ]
+        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        return AdapterResult(data=rows, status="available")
+
+    def _run_health_check(self, name: str, sql: str, detail: str) -> dict:
+        """Execute one health-check query, returning a normalized result row."""
+        try:
+            result = self._fetch_all(sql)
+        except DatabaseError as exc:
+            return {"check": name, "status": "unknown", "detail": str(exc.details or exc.message)}
+        value = result[0].get("v") if result else None
+        return {"check": name, "status": "ok", "value": value, "detail": detail}

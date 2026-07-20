@@ -45,6 +45,8 @@ class FakeIntrospectionService:
         schema: str,
         limit: int | None,
         order_by: str | None,
+        offset: int | None = None,
+        output_format: str | None = None,
     ) -> dict:
         return {
             "ok": True,
@@ -53,6 +55,8 @@ class FakeIntrospectionService:
             "schema": schema,
             "limit": limit,
             "order_by": order_by,
+            "offset": offset,
+            "output_format": output_format,
         }
 
     def select_columns(
@@ -61,6 +65,8 @@ class FakeIntrospectionService:
         columns: list[str],
         schema: str,
         limit: int | None,
+        offset: int | None = None,
+        output_format: str | None = None,
     ) -> dict:
         return {
             "ok": True,
@@ -69,6 +75,8 @@ class FakeIntrospectionService:
             "columns": columns,
             "schema": schema,
             "limit": limit,
+            "offset": offset,
+            "output_format": output_format,
         }
 
 
@@ -79,6 +87,7 @@ class FakeSelectService:
         limit: int | None,
         timeout_ms: int | None,
         explain: bool = False,
+        output_format: str | None = None,
     ) -> dict:
         return {
             "ok": True,
@@ -87,6 +96,7 @@ class FakeSelectService:
             "limit": limit,
             "timeout_ms": timeout_ms,
             "explain": explain,
+            "output_format": output_format,
         }
 
 

@@ -1,7 +1,7 @@
 # Write/DDL capability plugins (opt-in)
 
 This directory is **empty by default** and everything in it except this README is
-gitignored. The server ships **strictly read-only**: all 14 built-in tools are
+gitignored. The server ships **strictly read-only**: all 18 built-in tools are
 read-only and no mutation (write/DDL) code exists in the codebase.
 
 Write and DDL capabilities can only be added by **manually installing a plugin

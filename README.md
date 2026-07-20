@@ -1,6 +1,6 @@
 ﻿# db-introspection MCP server
 
-A **read-only** [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client (Codex, Claude, …) introspect and safely query **Oracle, PostgreSQL and SQL Server** databases. It exposes 14 read-only tools — list tables/columns/constraints/indexes/sequences/procedures/functions/jobs, read object DDL, search objects by name, sample rows, and run guarded `SELECT`s — across many named connections in a single process. Write/DDL is not possible unless you deliberately install an opt-in plugin (see below).
+A **read-only** [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client (Codex, Claude, …) introspect and safely query **Oracle, PostgreSQL and SQL Server** databases. It exposes 18 read-only tools — list tables/columns/constraints/indexes/sequences/procedures/functions/jobs, read object DDL, search objects by name, map foreign-key relationships, report table statistics, surface top queries and health checks, sample rows, and run guarded `SELECT`s — across many named connections in a single process. Write/DDL is not possible unless you deliberately install an opt-in plugin (see below).
 
 ## Requirements
 
@@ -189,14 +189,19 @@ The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) i
 - `db_list_procedures(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_functions(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
 - `db_list_jobs(connection="PROJECT_A/DEV/schema_a", schema="some_schema")`
-- `db_sample_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema", limit=20, order_by="id desc")` previews rows; `limit` and `order_by` are optional (`limit` defaults to `default_sample_limit` and is capped at `max_sample_limit`).
-- `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema", limit=20)`
+- `db_table_stats(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table")` returns a row-count estimate (from catalog statistics), table/index/total size in bytes, column count and last-analyzed time. Byte fields may be null when the connection cannot read the size catalogs (reported as a warning).
+- `db_list_foreign_keys(connection="PROJECT_A/DEV/schema_a", schema="some_schema", table="some_table")` returns FK edges (`constraint_name`, `table`, `columns`, `ref_table`, `ref_columns`, `on_delete`, `on_update`). `table` is optional and matches either side, so you can ask both what a table references and what references it.
+- `db_sample_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema", limit=20, order_by="id desc", offset=40, format="csv")` previews rows; all of `limit`/`order_by`/`offset`/`format` are optional. `offset` paginates (pair with `order_by` for stable pages); `format` is `rows` (default), `csv` or `json` (csv/json return the result serialized as a string).
+- `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema", limit=20, offset=40, format="json")`
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns="id,name", schema="some_schema")` (CSV is also supported)
-- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", limit=100, timeout_ms=8000)` (advanced/fallback); `limit` is capped at `max_select_limit` and `timeout_ms` overrides the connection's `statement_timeout_ms` for this call.
+- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", limit=100, timeout_ms=8000, format="csv")` (advanced/fallback); `limit` is capped at `max_select_limit`, `timeout_ms` overrides the connection's `statement_timeout_ms`, and `format` serializes the result as `csv`/`json`. For paging, put `OFFSET`/`FETCH` in your own SQL.
 - `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", explain=True)` returns an estimated execution plan as rows with `plan_text`.
+- `db_top_queries(connection="PROJECT_A/DEV/schema_a", limit=20)` returns the most time-consuming queries the engine has recorded (`query_id`, `query`, `calls`, `total_ms`, `mean_ms`, `rows`). Requires engine query-stats access (PostgreSQL `pg_stat_statements`, Oracle `V$SQLSTATS`, SQL Server query-stats DMVs); when unavailable the result is empty with an explanatory warning instead of an error.
+- `db_health_check(connection="PROJECT_A/DEV/schema_a")` runs dialect-specific health checks and returns one row per check (`check`, `status`, `value`, `detail`). Each check degrades independently to `status="unknown"` when the required catalog access is missing, so partial results are expected under a least-privilege user.
 
 `schema` is required for introspection and table-preview tools and is always validated against `allowed_schemas` for the selected connection.
 When `db_run_select(..., explain=True)` is used, the original validated SQL is planned without applying the tool `limit`; if `limit` is provided it is ignored and reported as a warning.
+The `db_top_queries` and `db_health_check` tools read instance-level catalogs/DMVs and therefore depend on the privileges granted to the connection's DB user; they are designed to degrade gracefully rather than fail.
 
 ## Install in Codex (VS Code)
 
@@ -233,10 +238,12 @@ Prefer specialized tools whenever possible:
 
 1. `db_list_tables` for table discovery, or `db_search_objects` to locate objects by partial name across all object types.
 2. `db_list_columns` for column discovery.
-3. `db_list_constraints`, `db_list_indexes`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs` for metadata.
+3. `db_list_constraints`, `db_list_indexes`, `db_list_foreign_keys`, `db_list_sequences`, `db_list_procedures`, `db_list_functions`, `db_list_jobs` for metadata (`db_list_foreign_keys` for relationship/dependency questions).
 4. `db_get_ddl` to read the source/definition of a view, procedure, function or table (table DDL is authoritative on Oracle and reconstructed from the catalog on PostgreSQL/SQL Server).
-5. `db_sample_table` for row previews from one table.
-6. `db_select_columns` for selecting explicit columns from one table.
-7. `db_run_select` only as fallback for advanced SQL (JOIN, CTE, aggregates, complex filters, window functions).
+5. `db_table_stats` for size/row-count questions about one table.
+6. `db_sample_table` for row previews from one table.
+7. `db_select_columns` for selecting explicit columns from one table.
+8. `db_run_select` only as fallback for advanced SQL (JOIN, CTE, aggregates, complex filters, window functions).
+9. `db_top_queries` and `db_health_check` for performance/diagnostics questions (privilege-dependent; degrade gracefully).
 
 All tools are read-only and are advertised to MCP clients with `readOnlyHint=true` / `destructiveHint=false` annotations.

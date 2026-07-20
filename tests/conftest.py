@@ -46,10 +46,10 @@ class BaseStubAdapter(DatabaseAdapter):
     def list_jobs(self) -> AdapterResult:
         return AdapterResult(data=[])
 
-    def sample_table(self, schema, table, limit, order_by) -> AdapterResult:
+    def sample_table(self, schema, table, limit, order_by, offset=0) -> AdapterResult:
         return AdapterResult(data=[])
 
-    def select_columns(self, schema, table, columns, limit) -> AdapterResult:
+    def select_columns(self, schema, table, columns, limit, offset=0) -> AdapterResult:
         return AdapterResult(data=[])
 
     def list_indexes(self, schemas, table=None) -> AdapterResult:
@@ -65,6 +65,18 @@ class BaseStubAdapter(DatabaseAdapter):
         return AdapterResult(data=[])
 
     def explain_select(self, sql_query, timeout_ms) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def table_stats(self, schema, table) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def list_foreign_keys(self, schemas, table=None) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def top_queries(self, limit) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def health_check(self) -> AdapterResult:
         return AdapterResult(data=[])
 
 
