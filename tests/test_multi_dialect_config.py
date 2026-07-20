@@ -82,6 +82,7 @@ def test_factory_creates_oracle_adapter():
         default_sample_limit=10,
         max_sample_limit=100,
         max_select_limit=200,
+        max_export_rows=1_000_000,
         statement_timeout_ms=5000,
         include_system_schemas=False,
     )
@@ -97,6 +98,7 @@ def test_factory_creates_mssql_adapter():
         default_sample_limit=10,
         max_sample_limit=100,
         max_select_limit=200,
+        max_export_rows=1_000_000,
         statement_timeout_ms=5000,
         include_system_schemas=False,
     )

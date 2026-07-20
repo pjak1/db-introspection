@@ -64,10 +64,24 @@ def test_db_search_objects_none_object_types_passes_none(monkeypatch):
     assert result["object_types"] is None
 
 
+# The export tools are read-only against the database (SELECT only) but write a
+# result file into the export directory, so their readOnlyHint is False while
+# destructiveHint stays False. Every other built-in tool is fully read-only.
+_FILE_WRITING_TOOLS = {"db_export_query", "db_export_table"}
+
+
 def test_all_tools_carry_read_only_annotation():
     tools = asyncio.run(server.mcp.list_tools())
     assert tools, "expected registered tools"
     for tool in tools:
         assert tool.annotations is not None, f"{tool.name} missing annotations"
-        assert tool.annotations.readOnlyHint is True, f"{tool.name} not read-only"
         assert tool.annotations.destructiveHint is False, f"{tool.name} marked destructive"
+        expected_read_only = tool.name not in _FILE_WRITING_TOOLS
+        assert tool.annotations.readOnlyHint is expected_read_only, (
+            f"{tool.name} readOnlyHint should be {expected_read_only}"
+        )
+
+
+def test_export_tools_are_registered():
+    tool_names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+    assert _FILE_WRITING_TOOLS <= tool_names

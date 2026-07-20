@@ -38,6 +38,10 @@ _DEFAULT_SAMPLE_LIMIT = 10
 _DEFAULT_MAX_SAMPLE_LIMIT = 100
 _DEFAULT_MAX_SELECT_LIMIT = 200
 _DEFAULT_STATEMENT_TIMEOUT_MS = 5000
+# Ceiling for file exports (db_export_table / db_export_query). Deliberately much
+# higher than the interactive row limits: exports stream to disk in batches, so
+# large result sets never sit in memory or in the MCP response.
+_DEFAULT_MAX_EXPORT_ROWS = 1_000_000
 
 
 def _default_conn_file_path() -> Path:
@@ -160,6 +164,7 @@ class Settings:
     default_sample_limit: int
     max_sample_limit: int
     max_select_limit: int
+    max_export_rows: int
     statement_timeout_ms: int
     include_system_schemas: bool
 
@@ -202,6 +207,11 @@ class Settings:
             conn_values.get("max_select_limit"),
             _DEFAULT_MAX_SELECT_LIMIT,
         )
+        max_export_rows = _parse_int(
+            "max_export_rows",
+            conn_values.get("max_export_rows"),
+            _DEFAULT_MAX_EXPORT_ROWS,
+        )
         statement_timeout_ms = _parse_int(
             "statement_timeout_ms",
             conn_values.get("statement_timeout_ms"),
@@ -219,6 +229,9 @@ class Settings:
         if max_select_limit <= 0:
             raise ConfigError("invalid_config",
                               "max_select_limit must be > 0.")
+        if max_export_rows <= 0:
+            raise ConfigError("invalid_config",
+                              "max_export_rows must be > 0.")
         if statement_timeout_ms <= 0:
             raise ConfigError("invalid_config",
                               "statement_timeout_ms must be > 0.")
@@ -235,6 +248,7 @@ class Settings:
             default_sample_limit=default_sample_limit,
             max_sample_limit=max_sample_limit,
             max_select_limit=max_select_limit,
+            max_export_rows=max_export_rows,
             statement_timeout_ms=statement_timeout_ms,
             include_system_schemas=include_system_schemas,
         )

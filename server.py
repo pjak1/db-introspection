@@ -25,6 +25,17 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=True,
 )
 
+# The export tools stay strictly read-only against the database (SELECT only) but
+# do write a result file into the configured export directory. readOnlyHint is
+# therefore False (they modify the local filesystem), while destructiveHint stays
+# False: they only create/overwrite a file inside the export directory.
+EXPORT = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
 # All connection-scoped tools expect `connection` as a canonical
 # 'project/environment/schema' key. Call db_list_connections to discover the
 # available keys.
@@ -231,8 +242,15 @@ def db_run_select(
 ) -> Envelope:
     """Run a guarded read-only SELECT query or return its estimated plan.
 
+    Write your SQL WITHOUT a row-limiting clause: the tool automatically wraps the
+    query to enforce `limit` (PostgreSQL/Oracle add LIMIT/FETCH; SQL Server adds
+    TOP, or OFFSET/FETCH when the query already has an ORDER BY/OFFSET). Do NOT add
+    your own `TOP` — on SQL Server it collides with the tool's OFFSET/FETCH wrapper.
+    Use the `limit` parameter instead (capped at `max_select_limit`).
+    For paging, add your own `ORDER BY ... OFFSET ... FETCH` (no `TOP`); the tool
+    limits it in place rather than re-wrapping.
     `format` is 'rows' (default), 'csv' or 'json' — csv/json return the result
-    serialized as a string. For paging, put OFFSET/FETCH in your own SQL.
+    serialized as a string. For large exports use db_export_query.
     `connection` is a 'project/environment/schema' key from db_list_connections.
     """
     return _with_services(
@@ -243,6 +261,72 @@ def db_run_select(
             timeout_ms=timeout_ms,
             explain=explain,
             output_format=format,
+        ),
+    )
+
+
+@mcp.tool(annotations=EXPORT)
+def db_export_query(
+    connection: str,
+    sql: str = "",
+    format: str = "csv",
+    filename: str | None = None,
+    max_rows: int | None = None,
+    timeout_ms: int | None = None,
+) -> Envelope:
+    """Stream a guarded read-only SELECT to a file and return a summary.
+
+    For large result sets: rows stream straight to disk in batches, so nothing is
+    held in memory or returned inline. `format` is 'csv' (default) or 'json'.
+    `filename` is an optional bare name (no path) written inside the server's
+    export directory; omit it for an auto-generated name. `max_rows` caps the
+    export (defaults to the connection's max_export_rows). Returns
+    {path, format, row_count, byte_size, truncated}.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda _, select_service: select_service.export_select(
+            sql_query=sql,
+            filename=filename,
+            output_format=format,
+            timeout_ms=timeout_ms,
+            max_rows=max_rows,
+        ),
+    )
+
+
+@mcp.tool(annotations=EXPORT)
+def db_export_table(
+    connection: str,
+    schema: str,
+    table: str = "",
+    columns: Any = None,
+    order_by: str | None = None,
+    format: str = "csv",
+    filename: str | None = None,
+    max_rows: int | None = None,
+) -> Envelope:
+    """Stream a whole table (optionally projected/ordered) to a file.
+
+    For large tables: rows stream straight to disk in batches. `columns` optionally
+    restricts the projection (list or CSV string; all columns when omitted).
+    `order_by` is 'column' or 'column ASC|DESC'. `format` is 'csv' (default) or
+    'json'. `filename` is an optional bare name written inside the export
+    directory. `max_rows` caps the export (defaults to the connection's
+    max_export_rows). Returns {path, format, row_count, byte_size, truncated}.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.export_table(
+            table=table,
+            schema=schema,
+            columns=_normalize_str_list(columns) or None,
+            order_by=order_by,
+            filename=filename,
+            output_format=format,
+            max_rows=max_rows,
         ),
     )
 

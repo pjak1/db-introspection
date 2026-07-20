@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from src.adapters._sql_helpers import (
@@ -8,6 +9,7 @@ from src.adapters._sql_helpers import (
     degraded_or_raise,
     int_or_none,
     rows_from_cursor,
+    stream_cursor_to_file,
 )
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.adapters.normalization import normalize_rows
@@ -860,6 +862,63 @@ class MssqlAdapter(DatabaseAdapter):
         """Run a read-only SQL query with timeout controls when supported."""
         data = self._fetch_all(sql_query, timeout_ms=timeout_ms)
         return AdapterResult(data=data)
+
+    def export_query(
+        self,
+        sql_query: str,
+        destination: Path,
+        fmt: str,
+        timeout_ms: int,
+        max_rows: int,
+    ) -> AdapterResult:
+        """Stream a validated SELECT to a file, never committing (read-only)."""
+        wrapped = self.wrap_select(sql_query, max_rows + 1)
+        conn = self.open_connection()
+        try:
+            if timeout_ms is not None:
+                conn.timeout = max(1, int(timeout_ms) // 1000)
+            with conn.cursor() as cur:
+                cur.arraysize = 1000
+                cur.execute(wrapped)
+                result = stream_cursor_to_file(cur, destination, fmt, max_rows)
+            conn.rollback()
+            return result
+        except DatabaseError:
+            raise
+        except Exception as exc:
+            raise DatabaseError(
+                "database_error", "MSSQL export failed.", details=str(exc)) from exc
+        finally:
+            conn.close()
+
+    def export_table(
+        self,
+        schema: str,
+        table: str,
+        columns: list[str] | None,
+        order_by: str | None,
+        destination: Path,
+        fmt: str,
+        timeout_ms: int,
+        max_rows: int,
+    ) -> AdapterResult:
+        """Build a dialect-correct table SELECT and stream it to a file."""
+        schema_q = self._q(schema)
+        table_q = self._q(table)
+        cols = ", ".join(self._q(column) for column in columns) if columns else "*"
+        query = f"SELECT {cols} FROM {schema_q}.{table_q}"
+        if order_by:
+            match = ORDER_BY_RE.match(order_by)
+            if not match:
+                raise ValidationError(
+                    "invalid_order_by",
+                    "order_by must be in format 'column' or 'column ASC|DESC'.",
+                )
+            direction = (match.group(2) or "ASC").upper()
+            query += f" ORDER BY {self._q(match.group(1))} {direction}"
+        result = self.export_query(query, destination, fmt, timeout_ms, max_rows)
+        result.schema_used = schema
+        return result
 
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         """Return a SQL Server estimated execution plan for a validated SELECT."""

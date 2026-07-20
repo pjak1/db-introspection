@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import quote_plus
 from typing import Any
 
@@ -7,7 +8,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from src.adapters._sql_helpers import ORDER_BY_RE, degraded_or_raise
+from src.adapters._sql_helpers import ORDER_BY_RE, degraded_or_raise, stream_cursor_to_file
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.adapters.normalization import normalize_rows
 from src.errors import DatabaseError, ValidationError
@@ -49,6 +50,11 @@ class PostgresAdapter(DatabaseAdapter):
     def wrap_select(cls, query: str, limit: int) -> str:
         """Wrap a query to enforce row limit in PostgreSQL syntax."""
         return f"SELECT * FROM ({query}) AS mcp_subquery LIMIT {int(limit)}"
+
+    @staticmethod
+    def _q(identifier: str) -> str:
+        """Safely quote PostgreSQL identifiers using double quotes."""
+        return f"\"{identifier.replace('\"', '\"\"')}\""
 
     def open_connection(self) -> Any:
         """Create and return a PostgreSQL connection, translating driver errors."""
@@ -582,6 +588,57 @@ class PostgresAdapter(DatabaseAdapter):
         """Run a read-only SQL query with statement timeout applied."""
         data = self._fetch_all(sql_query, timeout_ms=timeout_ms)
         return AdapterResult(data=data)
+
+    def export_query(
+        self,
+        sql_query: str,
+        destination: Path,
+        fmt: str,
+        timeout_ms: int,
+        max_rows: int,
+    ) -> AdapterResult:
+        """Stream a validated SELECT to a file inside a read-only transaction."""
+        wrapped = self.wrap_select(sql_query, max_rows + 1)
+        try:
+            with self.open_connection() as conn:
+                conn.read_only = True
+                # Plain (tuple) cursor: streaming writer maps values by position.
+                with conn.cursor() as cur:
+                    cur.arraysize = 1000
+                    if timeout_ms is not None:
+                        cur.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+                    cur.execute(wrapped)
+                    return stream_cursor_to_file(cur, destination, fmt, max_rows)
+        except psycopg.Error as exc:
+            raise DatabaseError(
+                "database_error", "Export query failed.", details=str(exc)) from exc
+
+    def export_table(
+        self,
+        schema: str,
+        table: str,
+        columns: list[str] | None,
+        order_by: str | None,
+        destination: Path,
+        fmt: str,
+        timeout_ms: int,
+        max_rows: int,
+    ) -> AdapterResult:
+        """Build a dialect-correct table SELECT and stream it to a file."""
+        cols = ", ".join(self._q(column) for column in columns) if columns else "*"
+        query = f"SELECT {cols} FROM {self._q(schema)}.{self._q(table)}"
+        if order_by:
+            match = ORDER_BY_RE.match(order_by)
+            if not match:
+                raise ValidationError(
+                    "invalid_order_by",
+                    "order_by must be in format 'column' or 'column ASC|DESC'.",
+                )
+            direction = (match.group(2) or "ASC").upper()
+            query += f" ORDER BY {self._q(match.group(1))} {direction}"
+        result = self.export_query(query, destination, fmt, timeout_ms, max_rows)
+        result.schema_used = schema
+        return result
 
     def explain_select(self, sql_query: str, timeout_ms: int) -> AdapterResult:
         """Return a PostgreSQL estimated execution plan for a validated SELECT."""

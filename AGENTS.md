@@ -21,6 +21,7 @@ Use `db_run_select` only as a last resort (fallback) for requests that cannot be
 - Read the source/definition of a view, procedure, function or table: use `db_get_ddl` (table DDL is authoritative on Oracle and reconstructed from the catalog on PostgreSQL/SQL Server).
 - Show table data preview / rows from one table: use `db_sample_table` (supports `offset` paging and `format` csv/json).
 - Select specific columns from one table: use `db_select_columns`.
+- Export a whole table / a query result to a file (large result sets, "dump to CSV/JSON", thousands of rows): use `db_export_table` / `db_export_query`. They stream to disk and return a summary (path, row_count, byte_size, truncated), not the rows. Prefer these over `format=csv`/`json` on the read tools when the result is large.
 - Performance / slow queries / database health: use `db_top_queries` and `db_health_check` (results depend on the DB user's catalog/DMV privileges).
 - Use `db_run_select` only for advanced queries that specialized tools cannot cover:
   - joins across tables

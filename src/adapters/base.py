@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar
 
 
@@ -226,5 +227,43 @@ class DatabaseAdapter(ABC):
 
         Each check degrades independently to status 'unknown' with a detail note
         when the required catalog/DMV access is missing.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def export_query(
+        self,
+        sql_query: str,
+        destination: Path,
+        fmt: str,
+        timeout_ms: int,
+        max_rows: int,
+    ) -> AdapterResult:
+        """Stream a validated read-only SELECT to `destination` in `fmt`.
+
+        Rows are fetched in batches and written straight to disk so the full
+        result set never sits in memory. At most `max_rows` rows are written; the
+        query is capped at `max_rows + 1` so an extra surviving row marks the
+        export as truncated. `data` is a summary dict:
+        {path, format, row_count, byte_size, truncated}.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def export_table(
+        self,
+        schema: str,
+        table: str,
+        columns: list[str] | None,
+        order_by: str | None,
+        destination: Path,
+        fmt: str,
+        timeout_ms: int,
+        max_rows: int,
+    ) -> AdapterResult:
+        """Stream a single table (optionally projected/ordered) to `destination`.
+
+        Builds a dialect-correct SELECT and delegates to `export_query`. Same
+        summary payload and truncation semantics.
         """
         raise NotImplementedError

@@ -5,7 +5,13 @@ import re
 from src.adapters.base import AdapterResult, DatabaseAdapter
 from src.config import Settings
 from src.errors import DatabaseError, ValidationError
-from src.services.export import normalize_output_format, serialize_rows
+from src.services.export import (
+    effective_export_limit,
+    normalize_export_format,
+    normalize_output_format,
+    resolve_export_path,
+    serialize_rows,
+)
 from src.services.response import Ok, service_operation
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
@@ -193,6 +199,68 @@ class IntrospectionService:
         schema_used = self._require_schema(schema)
         result = self._adapter.table_stats(schema=schema_used, table=table.strip())
         return Ok(result, schema_used=schema_used)
+
+    def _validate_export_columns(self, columns: list[str] | None) -> list[str] | None:
+        """Validate optional projection columns; None/empty means all columns."""
+        if not columns:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for column in columns:
+            if not isinstance(column, str):
+                raise ValidationError("invalid_columns", "Column names must be strings.")
+            name = column.strip()
+            if not name:
+                raise ValidationError("invalid_columns", "Column names cannot be empty.")
+            if not _IDENTIFIER_RE.match(name):
+                raise ValidationError("invalid_columns", f"Invalid column identifier: {name}")
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                normalized.append(name)
+        return normalized
+
+    @service_operation
+    def export_table(
+        self,
+        table: str,
+        schema: str,
+        columns: list[str] | None,
+        order_by: str | None,
+        filename: str | None,
+        output_format: str | None,
+        max_rows: int | None,
+    ) -> Ok:
+        """Stream a single table (optionally projected/ordered) to a file.
+
+        Rows stream straight to disk bounded by `max_export_rows`; only a summary
+        (path, row_count, byte_size, truncated) crosses the MCP boundary.
+        """
+        if not table.strip():
+            raise ValidationError("invalid_table", _EMPTY_TABLE_MESSAGE)
+        schema_used = self._require_schema(schema)
+        fmt = normalize_export_format(output_format)
+        normalized_columns = self._validate_export_columns(columns)
+        effective_max, warnings = effective_export_limit(
+            max_rows, self._settings.max_export_rows)
+        destination = resolve_export_path(
+            filename, fmt, default_stem=f"{schema_used}.{table.strip()}")
+        result = self._adapter.export_table(
+            schema=schema_used,
+            table=table.strip(),
+            columns=normalized_columns,
+            order_by=order_by,
+            destination=destination,
+            fmt=fmt,
+            timeout_ms=self._settings.statement_timeout_ms,
+            max_rows=effective_max,
+        )
+        if isinstance(result.data, dict) and result.data.get("truncated"):
+            warnings.append(
+                f"Export reached the row cap (max_rows={effective_max}); more rows "
+                "may exist. Raise max_rows or the connection's max_export_rows."
+            )
+        return Ok(result, schema_used=result.schema_used or schema_used, extra_warnings=warnings)
 
     @service_operation
     def list_foreign_keys(self, schema: str, table: str | None) -> Ok:

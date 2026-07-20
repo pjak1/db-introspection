@@ -1,8 +1,10 @@
 # Write/DDL capability plugins (opt-in)
 
 This directory is **empty by default** and everything in it except this README is
-gitignored. The server ships **strictly read-only**: all 18 built-in tools are
-read-only and no mutation (write/DDL) code exists in the codebase.
+gitignored. The server ships **strictly read-only** against the database: all 20
+built-in tools are read-only (the two export tools additionally write a result
+file to the configured export directory) and no database-mutation (write/DDL)
+code exists in the codebase.
 
 Write and DDL capabilities can only be added by **manually installing a plugin
 here**. An MCP client/agent cannot register tools or install plugins — only the

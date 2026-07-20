@@ -79,6 +79,20 @@ class BaseStubAdapter(DatabaseAdapter):
     def health_check(self) -> AdapterResult:
         return AdapterResult(data=[])
 
+    def export_query(self, sql_query, destination, fmt, timeout_ms, max_rows) -> AdapterResult:
+        return AdapterResult(data={
+            "path": str(destination), "format": fmt,
+            "row_count": 0, "byte_size": 0, "truncated": False,
+        })
+
+    def export_table(
+        self, schema, table, columns, order_by, destination, fmt, timeout_ms, max_rows
+    ) -> AdapterResult:
+        return AdapterResult(data={
+            "path": str(destination), "format": fmt,
+            "row_count": 0, "byte_size": 0, "truncated": False,
+        }, schema_used=schema)
+
 
 _SETTINGS_DEFAULTS = dict(
     db_dialect="postgres",
@@ -87,6 +101,7 @@ _SETTINGS_DEFAULTS = dict(
     default_sample_limit=10,
     max_sample_limit=100,
     max_select_limit=200,
+    max_export_rows=1_000_000,
     statement_timeout_ms=5000,
     include_system_schemas=False,
 )

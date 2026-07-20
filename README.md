@@ -1,6 +1,6 @@
 ﻿# db-introspection MCP server
 
-A **read-only** [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client (Codex, Claude, …) introspect and safely query **Oracle, PostgreSQL and SQL Server** databases. It exposes 18 read-only tools — list tables/columns/constraints/indexes/sequences/procedures/functions/jobs, read object DDL, search objects by name, map foreign-key relationships, report table statistics, surface top queries and health checks, sample rows, and run guarded `SELECT`s — across many named connections in a single process. Write/DDL is not possible unless you deliberately install an opt-in plugin (see below).
+A **read-only** [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client (Codex, Claude, …) introspect and safely query **Oracle, PostgreSQL and SQL Server** databases. It exposes 20 tools — list tables/columns/constraints/indexes/sequences/procedures/functions/jobs, read object DDL, search objects by name, map foreign-key relationships, report table statistics, surface top queries and health checks, sample rows, run guarded `SELECT`s, and stream large results to CSV/JSON files — across many named connections in a single process. All tools are read-only against the database; the two export tools additionally write a result file to a configured directory. Write/DDL to the database is not possible unless you deliberately install an opt-in plugin (see below).
 
 ## Requirements
 
@@ -67,6 +67,7 @@ All behavioral settings are configured **per connection, in that connection's `d
 | `default_sample_limit` | `10` | Rows returned by `db_sample_table`/`db_select_columns` when no `limit` is given. |
 | `max_sample_limit` | `100` | Hard cap for sample/select-columns `limit` (requests above it are truncated with a warning). |
 | `max_select_limit` | `200` | Hard cap for `db_run_select` result rows. |
+| `max_export_rows` | `1000000` | Hard cap for the file-export tools (`db_export_table`/`db_export_query`). Exports stream to disk, so this is deliberately much higher than the interactive limits. |
 | `statement_timeout_ms` | `5000` | Statement timeout applied to `db_run_select`. |
 | `include_system_schemas` | `false` | Default for `db_list_tables(include_system=...)`. |
 
@@ -83,7 +84,7 @@ max_select_limit:500
 statement_timeout_ms:10000
 ```
 
-The environment (or `.env`) holds only DB access secrets referenced via `${VAR}` (see below) and the write-plugin master switch `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS`. No connection behavior is read from the environment.
+The environment (or `.env`) holds only DB access secrets referenced via `${VAR}` (see below), the write-plugin master switch `DB_INTROSPECTION_ENABLE_WRITE_PLUGINS`, and the optional export-directory override `DB_INTROSPECTION_EXPORT_DIR` (where the export tools write files; defaults to `exports/` in the project root, which is gitignored). These are server-wide filesystem/feature switches, not per-connection behavior — no connection behavior is read from the environment.
 
 Example MSSQL `db_conn.txt`:
 ```txt
@@ -194,10 +195,13 @@ The opt-in write path (see above and [`plugins/README.md`](plugins/README.md)) i
 - `db_sample_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema", limit=20, order_by="id desc", offset=40, format="csv")` previews rows; all of `limit`/`order_by`/`offset`/`format` are optional. `offset` paginates (pair with `order_by` for stable pages); `format` is `rows` (default), `csv` or `json` (csv/json return the result serialized as a string).
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns=["id", "name"], schema="some_schema", limit=20, offset=40, format="json")`
 - `db_select_columns(connection="PROJECT_A/DEV/schema_a", table="some_table", columns="id,name", schema="some_schema")` (CSV is also supported)
-- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", limit=100, timeout_ms=8000, format="csv")` (advanced/fallback); `limit` is capped at `max_select_limit`, `timeout_ms` overrides the connection's `statement_timeout_ms`, and `format` serializes the result as `csv`/`json`. For paging, put `OFFSET`/`FETCH` in your own SQL.
+- `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", limit=100, timeout_ms=8000, format="csv")` (advanced/fallback); `limit` is capped at `max_select_limit`, `timeout_ms` overrides the connection's `statement_timeout_ms`, and `format` serializes the result as `csv`/`json`. The tool auto-wraps the query to enforce `limit` (SQL Server uses `TOP`, or `OFFSET/FETCH` when the query already has `ORDER BY`/`OFFSET`), so **do not add your own `TOP`** — it collides with the wrapper on SQL Server; use the `limit` parameter. For paging, add your own `ORDER BY ... OFFSET ... FETCH` (without `TOP`).
 - `db_run_select(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT 1", explain=True)` returns an estimated execution plan as rows with `plan_text`.
 - `db_top_queries(connection="PROJECT_A/DEV/schema_a", limit=20)` returns the most time-consuming queries the engine has recorded (`query_id`, `query`, `calls`, `total_ms`, `mean_ms`, `rows`). Requires engine query-stats access (PostgreSQL `pg_stat_statements`, Oracle `V$SQLSTATS`, SQL Server query-stats DMVs); when unavailable the result is empty with an explanatory warning instead of an error.
 - `db_health_check(connection="PROJECT_A/DEV/schema_a")` runs dialect-specific health checks and returns one row per check (`check`, `status`, `value`, `detail`). Each check degrades independently to `status="unknown"` when the required catalog access is missing, so partial results are expected under a least-privilege user.
+- `db_export_table(connection="PROJECT_A/DEV/schema_a", table="some_table", schema="some_schema", columns=["id","name"], order_by="id desc", format="csv", filename="dump", max_rows=500000)` streams a whole table to a file. `columns`/`order_by`/`filename`/`max_rows` are optional; `format` is `csv` (default) or `json`. Rows are fetched in batches and written straight to disk, so large tables never sit in memory or in the response — only a summary comes back: `{path, format, row_count, byte_size, truncated}`.
+- `db_export_query(connection="PROJECT_B/DEFAULT/schema_b", sql="SELECT ...", format="csv", filename="report", max_rows=500000, timeout_ms=8000)` streams the result of a guarded read-only SELECT to a file, same batched streaming and summary payload as `db_export_table`.
+- Export tools write into the export directory (`DB_INTROSPECTION_EXPORT_DIR`, default `exports/` in the project root, gitignored). `filename` must be a bare name (no path separators or `..`); when omitted an auto-generated name is used. `max_rows` is capped at the connection's `max_export_rows`; hitting the cap sets `truncated=true` with a warning. These are the only built-in tools that write to the local filesystem — they remain strictly read-only against the database and are advertised with `readOnlyHint=false` (file side effect) / `destructiveHint=false`.
 
 `schema` is required for introspection and table-preview tools and is always validated against `allowed_schemas` for the selected connection.
 When `db_run_select(..., explain=True)` is used, the original validated SQL is planned without applying the tool `limit`; if `limit` is provided it is ignored and reported as a warning.
@@ -245,5 +249,6 @@ Prefer specialized tools whenever possible:
 7. `db_select_columns` for selecting explicit columns from one table.
 8. `db_run_select` only as fallback for advanced SQL (JOIN, CTE, aggregates, complex filters, window functions).
 9. `db_top_queries` and `db_health_check` for performance/diagnostics questions (privilege-dependent; degrade gracefully).
+10. `db_export_table` / `db_export_query` for large exports to a file (streamed to disk; return a summary, not the rows) — prefer these over `format=csv`/`json` on the read tools when the result is big.
 
-All tools are read-only and are advertised to MCP clients with `readOnlyHint=true` / `destructiveHint=false` annotations.
+All tools are strictly read-only against the database and are advertised to MCP clients with `destructiveHint=false`. Every tool carries `readOnlyHint=true` except the two export tools (`db_export_table`/`db_export_query`), which write a result file into the export directory and are therefore marked `readOnlyHint=false`; they still never mutate the database.
