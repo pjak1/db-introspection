@@ -58,6 +58,34 @@ def register(context):
 The plugin opens its own database connection via `adapter_for(connection).open_connection()`
 and is responsible for committing. See the example for a full, commented implementation.
 
+## Calling stored procedures
+
+The reference `write_tools.py` plugin also registers
+`db_call_procedure(connection, procedure, args=None)` — a mutating tool that runs
+a stored procedure across all three dialects. It differs from the plain
+DDL/DML tools (which are dialect-agnostic `cur.execute(sql)`) because the call
+syntax is per-dialect:
+
+- **Oracle** — `cur.callproc(procedure, args)` (handles `pkg.proc`).
+- **PostgreSQL** — `CALL procedure(%s, ...)` with the args bound.
+- **SQL Server** — the ODBC call escape `{CALL procedure (?, ...)}`.
+
+Behavior and guarantees:
+
+- `procedure` is validated against a strict name regex (1–3 dot-separated
+  identifiers such as `proc`, `schema.proc`, Oracle `pkg.proc`) because the name
+  is interpolated into the statement — identifiers can't be bound. The **args are
+  always bound parameters** (IN only), never inlined.
+- When the procedure produces a result set (common on SQL Server), the **first**
+  result set is fetched and returned in `rows`; otherwise `rows` is null. Any
+  further result sets are consumed (not returned) so the procedure always runs to
+  completion — a procedure that emits a `SELECT` partway through is not cut off.
+- Same write gate as the other tools: `require_writable` first, then the call is
+  committed explicitly (mandatory for Oracle). Returns
+  `{procedure, rows_affected, rows}`.
+- Out of scope (v1): OUT/INOUT parameters and multiple result sets. Set-returning
+  PostgreSQL *functions* stay reachable through the read-only `db_run_select`.
+
 ## Per-connection plugin configuration
 
 A plugin can carry its own per-connection settings **in that connection's

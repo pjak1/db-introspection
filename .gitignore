@@ -217,6 +217,7 @@ DB_conns/*
 # Write/DDL capability plugins (opt-in, installed manually, never committed)
 plugins/*
 !plugins/README.md
+!plugins/write_tools.py
 
 # Exported result files (db_export_table / db_export_query default output dir)
 exports/
