@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import BaseStubAdapter, make_settings
+from conftest import BaseStubAdapter, make_settings, stub_session
 
 from src.adapters.base import AdapterResult
 from src.adapters.mssql import MssqlAdapter
@@ -98,6 +98,8 @@ def _stub_fetch_by_query(adapter, responder):
     def fake_fetch(query, params=None, timeout_ms=None):  # noqa: ANN001
         return responder(query, params)
     adapter._fetch_all = fake_fetch  # type: ignore[method-assign]
+    # The multi-query DDL reconstruction opens its own session above `_fetch_all`.
+    stub_session(adapter)
 
 
 def test_postgres_get_ddl_table_reconstructs_create_table():

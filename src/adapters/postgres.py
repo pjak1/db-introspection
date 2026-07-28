@@ -21,6 +21,7 @@ class PostgresAdapter(DatabaseAdapter):
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use PostgreSQL DSN."""
+        super().__init__()
         self._dsn = dsn
 
     @property
@@ -64,6 +65,32 @@ class PostgresAdapter(DatabaseAdapter):
             raise DatabaseError(
                 "database_error", "PostgreSQL connection failed.", details=str(exc)) from exc
 
+    def _begin_session(self, conn: Any) -> None:
+        """Put the connection in read-only mode for every transaction it starts.
+
+        psycopg refuses to set `read_only` once a transaction is in progress, so
+        this has to happen before the session's first query rather than per query.
+        """
+        conn.read_only = True
+
+    def _end_session(self, conn: Any) -> None:
+        """Discard the read transaction and close the connection."""
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _recover_after_error(self, conn: Any) -> None:
+        """Clear the aborted transaction so the session stays usable.
+
+        PostgreSQL rejects every command after a failed one with "current
+        transaction is aborted" until the transaction ends. Without this rollback
+        a single failing query would take down every later query of the same
+        tool call — `health_check`, which degrades per check, depends on it.
+        `read_only` survives the rollback because it applies to new transactions.
+        """
+        conn.rollback()
+
     def _fetch_all(
         self,
         query: str | sql.Composable,
@@ -73,21 +100,26 @@ class PostgresAdapter(DatabaseAdapter):
         """Execute SQL and return normalized rows as dictionaries.
 
         Read path only. Defense in depth: the connection is put in an
-        engine-enforced read-only transaction, so PostgreSQL itself rejects any
-        write regardless of what the lexical QueryGuard let through.
+        engine-enforced read-only transaction by `_begin_session`, so PostgreSQL
+        itself rejects any write regardless of what the lexical QueryGuard let
+        through.
         """
         try:
-            with self.open_connection() as conn:
-                conn.read_only = True
+            with self.session() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     if timeout_ms is not None:
                         cur.execute(
                             f"SET LOCAL statement_timeout = {int(timeout_ms)}")
                     cur.execute(query, params or ())
-                    if cur.description is None:
-                        return []
-                    rows = cur.fetchall()
-                    return normalize_rows(rows)
+                    rows = [] if cur.description is None else normalize_rows(cur.fetchall())
+                    if timeout_ms is not None:
+                        # SET LOCAL is transaction-scoped and the transaction now
+                        # spans the whole session, so undo it or it leaks into the
+                        # next query of the same tool call. Only on the success
+                        # path: after a failure the transaction is aborted and the
+                        # session rollback discards the setting anyway.
+                        cur.execute("SET LOCAL statement_timeout = DEFAULT")
+                    return rows
         except psycopg.Error as exc:
             raise DatabaseError(
                 "database_error", "Database query failed.", details=str(exc)) from exc
@@ -353,6 +385,13 @@ class PostgresAdapter(DatabaseAdapter):
         The result is a faithful reconstruction, not necessarily byte-identical to
         the original CREATE.
         """
+        # Columns, constraints and indexes share one session — three logins for
+        # one `db_get_ddl` call would buy nothing.
+        with self.session():
+            return self._table_ddl_in_session(schema, table)
+
+    def _table_ddl_in_session(self, schema: str, table: str) -> AdapterResult:
+        """Assemble the CREATE TABLE text; assumes a session is already open."""
         columns = self._fetch_all(
             """
             SELECT
@@ -787,7 +826,11 @@ class PostgresAdapter(DatabaseAdapter):
                 "%% of max_connections in use.",
             ),
         ]
-        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        # One session for all checks. Each check still degrades on its own: a
+        # failed query aborts the transaction, and `_recover_after_error` rolls
+        # it back so the remaining checks can still run.
+        with self.session():
+            rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
         return AdapterResult(data=rows, status="available")
 
     def _run_health_check(self, name: str, sql: str, detail: str) -> dict:

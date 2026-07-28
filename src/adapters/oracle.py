@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -27,6 +29,7 @@ class OracleAdapter(DatabaseAdapter):
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use Oracle DSN."""
+        super().__init__()
         self._dsn = dsn
 
     @property
@@ -75,6 +78,49 @@ class OracleAdapter(DatabaseAdapter):
             raise DatabaseError(
                 "database_error", "Oracle connection failed.", details=str(exc)) from exc
 
+    def _begin_session(self, conn: Any) -> None:
+        """Open the engine-enforced read-only transaction for this session.
+
+        `SET TRANSACTION READ ONLY` must be the first statement of the
+        transaction, so it runs once here rather than per query — a second one
+        inside the same transaction would raise ORA-01453.
+        """
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+
+    def _end_session(self, conn: Any) -> None:
+        """End the read-only transaction and close the connection."""
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _recover_after_error(self, conn: Any) -> None:
+        """No-op: Oracle rolls back the failed statement only, so the read-only
+        transaction stays open and usable for the next query."""
+
+    @contextmanager
+    def _query_timeout(self, conn: Any, timeout_ms: int | None) -> Iterator[None]:
+        """Apply a call timeout for one query only, then restore the old value.
+
+        The timeout lives on the connection, which is now shared by every query
+        of the same tool call, so it has to be undone — otherwise a timeout set
+        by `run_select` would leak into whatever runs next.
+        """
+        if timeout_ms is None:
+            yield
+            return
+        # python-oracledb timeout property name differs by version.
+        attrs = [name for name in ("call_timeout", "callTimeout") if hasattr(conn, name)]
+        saved = {name: getattr(conn, name) for name in attrs}
+        for name in attrs:
+            setattr(conn, name, int(timeout_ms))
+        try:
+            yield
+        finally:
+            for name, value in saved.items():
+                setattr(conn, name, value)
+
     def _fetch_all(
         self,
         query: str,
@@ -84,22 +130,16 @@ class OracleAdapter(DatabaseAdapter):
         """Execute SQL and return normalized rows as dictionaries.
 
         Read path only. Defense in depth: the whole read runs inside an
-        engine-enforced read-only transaction (`SET TRANSACTION READ ONLY`, which
-        must be the first statement of the transaction), so Oracle itself rejects
-        any write regardless of what the lexical QueryGuard let through.
+        engine-enforced read-only transaction opened by `_begin_session`, so
+        Oracle itself rejects any write regardless of what the lexical
+        QueryGuard let through.
         """
         try:
-            with self.open_connection() as conn:
-                # python-oracledb timeout property name differs by version.
-                if timeout_ms is not None:
-                    if hasattr(conn, "call_timeout"):
-                        setattr(conn, "call_timeout", int(timeout_ms))
-                    if hasattr(conn, "callTimeout"):
-                        setattr(conn, "callTimeout", int(timeout_ms))
-                with conn.cursor() as cur:
-                    cur.execute("SET TRANSACTION READ ONLY")
-                    cur.execute(query, params or {})
-                    return rows_from_cursor(cur)
+            with self.session() as conn:
+                with self._query_timeout(conn, timeout_ms):
+                    with conn.cursor() as cur:
+                        cur.execute(query, params or {})
+                        return rows_from_cursor(cur)
         except DatabaseError:
             raise
         except Exception as exc:
@@ -620,6 +660,13 @@ class OracleAdapter(DatabaseAdapter):
 
     def table_stats(self, schema: str, table: str) -> AdapterResult:
         """Return row-count estimate and size statistics for one table."""
+        # Base row and segment sizes share one session — two logins for one tool
+        # call would buy nothing.
+        with self.session():
+            return self._table_stats_in_session(schema, table)
+
+    def _table_stats_in_session(self, schema: str, table: str) -> AdapterResult:
+        """Collect the table statistics; assumes a session is already open."""
         owner = schema.upper()
         tbl = table.upper()
         base = self._fetch_all(
@@ -759,7 +806,10 @@ class OracleAdapter(DatabaseAdapter):
                 "tables with stale optimizer statistics.",
             ),
         ]
-        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        # One session for all checks: they run sequentially anyway, so a login
+        # per check would buy nothing.
+        with self.session():
+            rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
         return AdapterResult(data=rows, status="available")
 
     def _run_health_check(self, name: str, sql: str, detail: str) -> dict:

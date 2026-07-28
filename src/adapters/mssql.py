@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ class MssqlAdapter(DatabaseAdapter):
 
     def __init__(self, dsn: str):
         """Initialize adapter with a ready-to-use ODBC connection string."""
+        super().__init__()
         self._dsn = dsn
 
     @property
@@ -252,6 +255,43 @@ class MssqlAdapter(DatabaseAdapter):
             [{"plan_text": row[stmt_index]} for row in fetched_rows]
         )
 
+    def _begin_session(self, conn: Any) -> None:
+        """No setup: SQL Server has no read-only transaction mode to switch on.
+
+        Read-only is enforced at the other end, by `_end_session` never
+        committing.
+        """
+
+    def _end_session(self, conn: Any) -> None:
+        """Roll the session back — never commit — and close the connection."""
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _recover_after_error(self, conn: Any) -> None:
+        """Roll back the failed statement so the session stays usable."""
+        conn.rollback()
+
+    @contextmanager
+    def _query_timeout(self, conn: Any, timeout_ms: int | None) -> Iterator[None]:
+        """Apply a timeout for one query only, then restore the old value.
+
+        `timeout` lives on the connection, which is now shared by every query of
+        the same tool call, so it has to be undone — otherwise a timeout set by
+        `run_select` would leak into whatever runs next.
+        """
+        if timeout_ms is None:
+            yield
+            return
+        saved = getattr(conn, "timeout", None)
+        # pyodbc timeouts are whole seconds, so sub-second values round up to 1.
+        conn.timeout = max(1, int(timeout_ms) // 1000)
+        try:
+            yield
+        finally:
+            conn.timeout = saved
+
     def _fetch_all(
         self,
         query: str,
@@ -261,26 +301,21 @@ class MssqlAdapter(DatabaseAdapter):
         """Execute SQL and return normalized rows as dictionaries.
 
         Read path only. SQL Server has no engine-level read-only transaction mode,
-        so read-only is enforced by never committing: the transaction is always
-        rolled back, discarding any side effect a read might have triggered (a
-        plain `with conn` would otherwise commit on exit).
+        so read-only is enforced by never committing: `_end_session` always rolls
+        the transaction back, discarding any side effect a read might have
+        triggered (a plain `with conn` would otherwise commit on exit).
         """
-        conn = self.open_connection()
         try:
-            if timeout_ms is not None:
-                conn.timeout = max(1, int(timeout_ms) // 1000)
-            with conn.cursor() as cur:
-                cur.execute(query, params or ())
-                rows = rows_from_cursor(cur)
-            conn.rollback()
-            return rows
+            with self.session() as conn:
+                with self._query_timeout(conn, timeout_ms):
+                    with conn.cursor() as cur:
+                        cur.execute(query, params or ())
+                        return rows_from_cursor(cur)
         except DatabaseError:
             raise
         except Exception as exc:
             raise DatabaseError(
                 "database_error", "MSSQL query failed.", details=str(exc)) from exc
-        finally:
-            conn.close()
 
     @staticmethod
     def _in_clause(values: tuple[str, ...]) -> tuple[str, tuple[Any, ...]]:
@@ -356,7 +391,14 @@ class MssqlAdapter(DatabaseAdapter):
         table: str | None = None,
         constraint_type: str | None = None,
     ) -> AdapterResult:
-        """List table constraints with optional filters."""
+        """List table constraints with optional filters.
+
+        The referenced side of a foreign key comes from the `sys` catalogs, not
+        from `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE`: that view reports the
+        columns the constraint is *defined on*, so for a foreign key it names the
+        referencing table, not the referenced one. Non-foreign-key constraints
+        get NULL in the `foreign_*` columns, matching Oracle and PostgreSQL.
+        """
         in_clause, params = self._in_clause(schemas)
         query = f"""
             SELECT
@@ -364,19 +406,36 @@ class MssqlAdapter(DatabaseAdapter):
                 tc.TABLE_NAME AS table_name,
                 tc.CONSTRAINT_NAME AS constraint_name,
                 tc.CONSTRAINT_TYPE AS constraint_type,
-                STRING_AGG(kcu.COLUMN_NAME, ', ') AS columns,
-                ccu.TABLE_SCHEMA AS foreign_table_schema,
-                ccu.TABLE_NAME AS foreign_table_name,
-                STRING_AGG(ccu.COLUMN_NAME, ', ') AS foreign_columns,
+                STRING_AGG(kcu.COLUMN_NAME, ', ')
+                    WITHIN GROUP (ORDER BY kcu.ORDINAL_POSITION) AS columns,
+                fk.ref_schema AS foreign_table_schema,
+                fk.ref_table AS foreign_table_name,
+                fk.ref_columns AS foreign_columns,
                 chk.CHECK_CLAUSE AS check_clause
             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
             LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
               ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
              AND tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
              AND tc.TABLE_NAME = kcu.TABLE_NAME
-            LEFT JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
-              ON tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
-             AND tc.CONSTRAINT_SCHEMA = ccu.CONSTRAINT_SCHEMA
+            LEFT JOIN (
+                SELECT
+                    f.name AS constraint_name,
+                    SCHEMA_NAME(pt.schema_id) AS constraint_schema,
+                    SCHEMA_NAME(rt.schema_id) AS ref_schema,
+                    rt.name AS ref_table,
+                    (SELECT STRING_AGG(rc.name, ', ')
+                            WITHIN GROUP (ORDER BY fkc.constraint_column_id)
+                     FROM sys.foreign_key_columns fkc
+                     JOIN sys.columns rc
+                       ON rc.object_id = fkc.referenced_object_id
+                      AND rc.column_id = fkc.referenced_column_id
+                     WHERE fkc.constraint_object_id = f.object_id) AS ref_columns
+                FROM sys.foreign_keys f
+                JOIN sys.tables pt ON pt.object_id = f.parent_object_id
+                JOIN sys.tables rt ON rt.object_id = f.referenced_object_id
+            ) fk
+              ON fk.constraint_name = tc.CONSTRAINT_NAME
+             AND fk.constraint_schema = tc.CONSTRAINT_SCHEMA
             LEFT JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS chk
               ON tc.CONSTRAINT_NAME = chk.CONSTRAINT_NAME
              AND tc.CONSTRAINT_SCHEMA = chk.CONSTRAINT_SCHEMA
@@ -388,8 +447,9 @@ class MssqlAdapter(DatabaseAdapter):
                 tc.TABLE_NAME,
                 tc.CONSTRAINT_NAME,
                 tc.CONSTRAINT_TYPE,
-                ccu.TABLE_SCHEMA,
-                ccu.TABLE_NAME,
+                fk.ref_schema,
+                fk.ref_table,
+                fk.ref_columns,
                 chk.CHECK_CLAUSE
             ORDER BY tc.CONSTRAINT_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME
         """
@@ -702,6 +762,13 @@ class MssqlAdapter(DatabaseAdapter):
         result is a faithful reconstruction, not necessarily byte-identical to the
         original CREATE.
         """
+        # Columns, keys, foreign keys, checks and indexes share one session —
+        # five logins for one `db_get_ddl` call would buy nothing.
+        with self.session():
+            return self._table_ddl_in_session(schema, table)
+
+    def _table_ddl_in_session(self, schema: str, table: str) -> AdapterResult:
+        """Assemble the CREATE TABLE text; assumes a session is already open."""
         column_lines = self._ddl_column_lines(schema, table)
         if not column_lines:
             return AdapterResult(
@@ -1091,7 +1158,10 @@ class MssqlAdapter(DatabaseAdapter):
                 "tables stored as heaps (no clustered index).",
             ),
         ]
-        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        # One session for all checks: they run sequentially anyway, so a login
+        # per check would buy nothing.
+        with self.session():
+            rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
         return AdapterResult(data=rows, status="available")
 
     def _run_health_check(self, name: str, sql: str, detail: str) -> dict:

@@ -94,6 +94,75 @@ class BaseStubAdapter(DatabaseAdapter):
         }, schema_used=schema)
 
 
+class RecordingConnection:
+    """A connection fake that records what a session did to it.
+
+    Enough surface for `DatabaseAdapter.session()`: the dialect hooks call
+    `rollback()`/`close()`, Oracle's `_begin_session` runs a cursor statement and
+    Postgres' sets `read_only`. Tests use `executed` to assert how many times the
+    read-only setup ran, which is how "one connection per tool call" is verified.
+    """
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+        self.read_only: bool | None = None
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+        self.call_timeout: int | None = None
+        self.timeout: int | None = None
+
+    def cursor(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return _RecordingCursor(self)
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+class _RecordingCursor:
+    """Minimal cursor that appends every executed statement to its connection."""
+
+    def __init__(self, conn: RecordingConnection) -> None:
+        self._conn = conn
+        self.description = None
+
+    def execute(self, query, params=None):  # noqa: ANN001
+        self._conn.executed.append(str(query))
+
+    def fetchall(self):
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+def stub_session(adapter) -> RecordingConnection:  # noqa: ANN001
+    """Give `adapter` a fake connection so `session()` never reaches a database.
+
+    Needed by tests that patch `_fetch_all`: methods which fan out into several
+    queries now open the session themselves, above that seam. Returns the shared
+    connection so a test can assert on it.
+    """
+    conn = RecordingConnection()
+    adapter.open_connection = lambda: conn  # type: ignore[method-assign]
+    return conn
+
+
 _SETTINGS_DEFAULTS = dict(
     db_dialect="postgres",
     db_dsn="postgresql://user:pass@localhost:5432/db",

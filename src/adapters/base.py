@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -20,6 +23,18 @@ class DatabaseAdapter(ABC):
     """Abstract contract for DB-specific metadata and query operations."""
     dialect_name: ClassVar[str | None] = None
     _registry: ClassVar[dict[str, type["DatabaseAdapter"]]] = {}
+
+    def __init__(self) -> None:
+        """Initialize the per-call connection holder.
+
+        Subclasses that define their own `__init__` must call `super().__init__()`.
+        """
+        # Thread-local because the registry caches one adapter instance per
+        # connection key and shares it across every tool call
+        # (`ConnectionRegistry._cache`). Today's dispatch is serial — FastMCP
+        # calls sync tool functions inline on the event-loop thread — so this is
+        # not strictly required; it is cheap insurance if that ever changes.
+        self._session_local = threading.local()
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Auto-register subclasses by normalized dialect name."""
@@ -109,6 +124,55 @@ class DatabaseAdapter(ABC):
     def open_connection(self) -> Any:
         """Open a new read/write-capable DBAPI connection (implemented per dialect)."""
         raise NotImplementedError
+
+    @contextmanager
+    def session(self) -> Iterator[Any]:
+        """Hold a single connection for the duration of one logical operation.
+
+        Reentrant: a nested `session()` yields the connection already open, so a
+        method that fans out into several `_fetch_all` calls pays exactly one
+        login instead of one per query. The connection is always closed when the
+        outermost block exits — this is deliberately not a pool, so the read-only
+        guarantee, the absence of leftover session state and the absence of idle
+        connections all keep holding for free.
+        """
+        borrowed = getattr(self._session_local, "conn", None)
+        if borrowed is not None:
+            try:
+                yield borrowed
+            except BaseException:
+                # The session outlives this query, so it must be put back into a
+                # usable state — otherwise every later query in the same call
+                # fails too (PostgreSQL aborts the whole transaction on error).
+                self._safe_recover(borrowed)
+                raise
+            return
+
+        conn = self.open_connection()
+        self._session_local.conn = conn
+        try:
+            self._begin_session(conn)
+            yield conn
+        finally:
+            self._session_local.conn = None
+            self._end_session(conn)
+
+    def _safe_recover(self, conn: Any) -> None:
+        """Recover the session best-effort; the original error always wins."""
+        try:
+            self._recover_after_error(conn)
+        except Exception:
+            pass
+
+    def _begin_session(self, conn: Any) -> None:
+        """Apply the dialect's read-only setup, exactly once per session."""
+
+    def _end_session(self, conn: Any) -> None:
+        """Tear the session down; must close the connection whatever happens."""
+        conn.close()
+
+    def _recover_after_error(self, conn: Any) -> None:
+        """Return the session to a state where the next query can still run."""
 
     @abstractmethod
     def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
