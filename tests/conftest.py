@@ -5,7 +5,21 @@ from pathlib import Path
 import pytest
 
 from src.adapters.base import AdapterResult, DatabaseAdapter
+from src.adapters.session import SessionPolicy
 from src.config import Settings
+
+
+class _NoopSessionPolicy:
+    """Session policy for stubs: close the connection, nothing dialect-specific."""
+
+    def begin(self, conn) -> None:  # noqa: ANN001
+        pass
+
+    def end(self, conn) -> None:  # noqa: ANN001
+        conn.close()
+
+    def recover(self, conn) -> None:  # noqa: ANN001
+        pass
 
 
 class BaseStubAdapter(DatabaseAdapter):
@@ -24,6 +38,9 @@ class BaseStubAdapter(DatabaseAdapter):
 
     def open_connection(self):
         raise NotImplementedError
+
+    def session_policy(self) -> SessionPolicy:
+        return _NoopSessionPolicy()
 
     def list_tables(self, schemas, include_system) -> AdapterResult:
         return AdapterResult(data=[])
@@ -53,6 +70,12 @@ class BaseStubAdapter(DatabaseAdapter):
         return AdapterResult(data=[])
 
     def list_indexes(self, schemas, table=None) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def index_usage(self, schemas, table=None, include_fragmentation=False) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def column_stats(self, schema, table, column=None, include_histogram=False) -> AdapterResult:
         return AdapterResult(data=[])
 
     def get_ddl(self, schema, object_name, object_type) -> AdapterResult:
@@ -98,7 +121,7 @@ class RecordingConnection:
     """A connection fake that records what a session did to it.
 
     Enough surface for `DatabaseAdapter.session()`: the dialect hooks call
-    `rollback()`/`close()`, Oracle's `_begin_session` runs a cursor statement and
+    `rollback()`/`close()`, Oracle's `begin` runs a cursor statement and
     Postgres' sets `read_only`. Tests use `executed` to assert how many times the
     read-only setup ran, which is how "one connection per tool call" is verified.
     """

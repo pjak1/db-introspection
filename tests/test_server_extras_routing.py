@@ -9,6 +9,27 @@ class FakeIntrospectionService:
     def list_indexes(self, schema: str, table: str | None) -> dict:
         return {"ok": True, "called": "list_indexes", "schema": schema, "table": table}
 
+    def index_usage(self, schema: str, table: str | None,
+                    include_fragmentation: bool = False) -> dict:
+        return {
+            "ok": True,
+            "called": "index_usage",
+            "schema": schema,
+            "table": table,
+            "include_fragmentation": include_fragmentation,
+        }
+
+    def column_stats(self, schema: str, table: str, column: str | None = None,
+                     include_histogram: bool = False) -> dict:
+        return {
+            "ok": True,
+            "called": "column_stats",
+            "schema": schema,
+            "table": table,
+            "column": column,
+            "include_histogram": include_histogram,
+        }
+
     def get_ddl(self, schema: str, object_name: str, object_type: str) -> dict:
         return {
             "ok": True,
@@ -38,6 +59,23 @@ def test_db_list_indexes_routes(monkeypatch):
     result = server.db_list_indexes(connection="A/DEV/public", schema="public", table="users")
     assert result["called"] == "list_indexes"
     assert result["table"] == "users"
+
+
+def test_db_index_usage_routes(monkeypatch):
+    monkeypatch.setattr(server, "connection_registry", FakeRegistry())
+    result = server.db_index_usage(
+        connection="A/DEV/public", schema="public", table="users",
+        include_fragmentation=True)
+    assert result["called"] == "index_usage"
+    assert result["include_fragmentation"] is True
+
+
+def test_db_column_stats_routes(monkeypatch):
+    monkeypatch.setattr(server, "connection_registry", FakeRegistry())
+    result = server.db_column_stats(
+        connection="A/DEV/public", schema="public", table="users", column="email")
+    assert result["called"] == "column_stats"
+    assert result["column"] == "email"
 
 
 def test_db_get_ddl_routes(monkeypatch):

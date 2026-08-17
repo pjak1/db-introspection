@@ -71,6 +71,51 @@ def test_mssql_list_indexes_skips_heaps_and_binds_table():
     assert captured["params"] == ("dbo", "users", "users")
 
 
+def test_mssql_list_indexes_separates_key_and_included_columns():
+    """Included columns carry key_ordinal 0, so mixing them corrupts the key."""
+    adapter = MssqlAdapter("Driver=test")
+    captured = _capture(adapter)
+    adapter.list_indexes(schemas=("dbo",))
+
+    query = captured["query"]
+    # Key columns: filtered to is_included_column = 0 and ordered by key position.
+    assert "ic.is_included_column = 0) AS columns" in query
+    assert "WITHIN GROUP (ORDER BY ic.key_ordinal)" in query
+    # INCLUDE columns: their own aggregate, ordered by declaration order.
+    assert "ic.is_included_column = 1) AS included_columns" in query
+    assert "WITHIN GROUP (ORDER BY ic.index_column_id)" in query
+    assert "ix.filter_definition" in query
+
+
+def test_postgres_list_indexes_separates_key_and_included_columns():
+    """`indkey` holds key and INCLUDE columns; `indnkeyatts` splits them."""
+    adapter = PostgresAdapter("postgresql://unused")
+    captured = _capture(adapter)
+    adapter.list_indexes(schemas=("public",))
+
+    query = captured["query"]
+    assert "generate_series(1, ix.indnkeyatts)" in query
+    assert "generate_series(ix.indnkeyatts + 1, ix.indnatts)" in query
+    assert "AS included_columns" in query
+    # The old 0-based indkey walk conflated the two lists.
+    assert "generate_subscripts" not in query
+    assert "ix.indisvalid AS is_valid" in query
+
+
+def test_oracle_list_indexes_keeps_row_shape_and_adds_clustering_factor():
+    """Oracle has no INCLUDE clause, so the column stays NULL to match the others."""
+    adapter = OracleAdapter("user/pass@db")
+    captured = _capture(adapter)
+    adapter.list_indexes(schemas=("sample_schema",))
+
+    query = captured["query"]
+    assert "AS included_columns" in query
+    assert "i.clustering_factor" in query
+    assert "AS is_functional" in query
+    # Newly selected non-aggregated columns must be grouped or Oracle rejects it.
+    assert "i.clustering_factor, i.distinct_keys, i.status" in query.split("GROUP BY")[1]
+
+
 # --------------------------------------------------------------------------
 # get_ddl adapter SQL
 # --------------------------------------------------------------------------

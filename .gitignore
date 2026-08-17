@@ -221,3 +221,6 @@ plugins/*
 
 # Exported result files (db_export_table / db_export_query default output dir)
 exports/
+
+# CSV source files for db_import_csv (default input dir)
+imports/

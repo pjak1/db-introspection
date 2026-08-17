@@ -99,6 +99,49 @@ class IntrospectionService:
         return Ok(result, schema_used=schema_used)
 
     @service_operation
+    def index_usage(
+        self,
+        schema: str,
+        table: str | None,
+        include_fragmentation: bool = False,
+    ) -> Ok:
+        """Return per-index read/write counters for the effective schema scope."""
+        schema_used = self._require_schema(schema)
+        normalized_table = table.strip() if isinstance(table, str) and table.strip() else None
+        result = self._adapter.index_usage(
+            schemas=(schema_used,),
+            table=normalized_table,
+            include_fragmentation=bool(include_fragmentation),
+        )
+        return Ok(result, schema_used=schema_used)
+
+    @service_operation
+    def column_stats(
+        self,
+        schema: str,
+        table: str,
+        column: str | None = None,
+        include_histogram: bool = False,
+    ) -> Ok:
+        """Return per-column optimizer statistics for one table."""
+        if not table.strip():
+            raise ValidationError("invalid_table", _EMPTY_TABLE_MESSAGE)
+        schema_used = self._require_schema(schema)
+        normalized_column = (
+            column.strip() if isinstance(column, str) and column.strip() else None
+        )
+        if normalized_column and not _IDENTIFIER_RE.match(normalized_column):
+            raise ValidationError(
+                "invalid_columns", f"Invalid column identifier: {normalized_column}")
+        result = self._adapter.column_stats(
+            schema=schema_used,
+            table=table.strip(),
+            column=normalized_column,
+            include_histogram=bool(include_histogram),
+        )
+        return Ok(result, schema_used=schema_used)
+
+    @service_operation
     def get_ddl(self, schema: str, object_name: str, object_type: str) -> Ok:
         """Return the DDL of a database object within the allowed schema scope."""
         schema_used = self._require_schema(schema)

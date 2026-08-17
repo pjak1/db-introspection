@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
+
+from src.adapters.session import ConnectionSession, SessionPolicy
 
 
 @dataclass
@@ -23,18 +23,9 @@ class DatabaseAdapter(ABC):
     """Abstract contract for DB-specific metadata and query operations."""
     dialect_name: ClassVar[str | None] = None
     _registry: ClassVar[dict[str, type["DatabaseAdapter"]]] = {}
-
-    def __init__(self) -> None:
-        """Initialize the per-call connection holder.
-
-        Subclasses that define their own `__init__` must call `super().__init__()`.
-        """
-        # Thread-local because the registry caches one adapter instance per
-        # connection key and shares it across every tool call
-        # (`ConnectionRegistry._cache`). Today's dispatch is serial — FastMCP
-        # calls sync tool functions inline on the event-loop thread — so this is
-        # not strictly required; it is cheap insurance if that ever changes.
-        self._session_local = threading.local()
+    # None until `session()` builds it, then shadowed per instance. Declared here
+    # so the contract needs no __init__ of its own.
+    _connection_session: ConnectionSession | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Auto-register subclasses by normalized dialect name."""
@@ -96,7 +87,15 @@ class DatabaseAdapter(ABC):
 
     @abstractmethod
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-        """List indexes for the given schema scope, optionally filtered by table."""
+        """List indexes for the given schema scope, optionally filtered by table.
+
+        Row shape: schema, table_name, index_name, is_unique, is_primary,
+        index_type, columns, included_columns. `columns` holds the key columns in
+        key order and nothing else; `included_columns` holds the INCLUDE/covering
+        columns, or NULL on dialects without that concept. Keeping them apart is
+        what makes the result usable for covering-index decisions. Dialects add
+        their own extras on top (clustering_factor, filter_definition, is_valid…).
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -125,54 +124,32 @@ class DatabaseAdapter(ABC):
         """Open a new read/write-capable DBAPI connection (implemented per dialect)."""
         raise NotImplementedError
 
-    @contextmanager
-    def session(self) -> Iterator[Any]:
-        """Hold a single connection for the duration of one logical operation.
+    @abstractmethod
+    def session_policy(self) -> SessionPolicy:
+        """Return this dialect's session setup and teardown policy.
 
-        Reentrant: a nested `session()` yields the connection already open, so a
-        method that fans out into several `_fetch_all` calls pays exactly one
-        login instead of one per query. The connection is always closed when the
-        outermost block exits — this is deliberately not a pool, so the read-only
-        guarantee, the absence of leftover session state and the absence of idle
-        connections all keep holding for free.
+        The connection lifecycle itself lives in `ConnectionSession`; this is the
+        one dialect-specific part of it, so it is the only part the contract asks
+        an adapter for.
         """
-        borrowed = getattr(self._session_local, "conn", None)
-        if borrowed is not None:
-            try:
-                yield borrowed
-            except BaseException:
-                # The session outlives this query, so it must be put back into a
-                # usable state — otherwise every later query in the same call
-                # fails too (PostgreSQL aborts the whole transaction on error).
-                self._safe_recover(borrowed)
-                raise
-            return
+        raise NotImplementedError
 
-        conn = self.open_connection()
-        self._session_local.conn = conn
-        try:
-            self._begin_session(conn)
-            yield conn
-        finally:
-            self._session_local.conn = None
-            self._end_session(conn)
+    def session(self) -> AbstractContextManager[Any]:
+        """Hold one connection for one logical operation; see `ConnectionSession`.
 
-    def _safe_recover(self, conn: Any) -> None:
-        """Recover the session best-effort; the original error always wins."""
-        try:
-            self._recover_after_error(conn)
-        except Exception:
-            pass
-
-    def _begin_session(self, conn: Any) -> None:
-        """Apply the dialect's read-only setup, exactly once per session."""
-
-    def _end_session(self, conn: Any) -> None:
-        """Tear the session down; must close the connection whatever happens."""
-        conn.close()
-
-    def _recover_after_error(self, conn: Any) -> None:
-        """Return the session to a state where the next query can still run."""
+        Reentrant, so a method that fans out into several queries pays one login
+        instead of one per query.
+        """
+        if self._connection_session is None:
+            # Built on first use rather than in an __init__: the policy may need
+            # adapter state that a subclass sets up in its own constructor, and
+            # this way no adapter has to remember to call super().__init__().
+            # Assigning here shadows the class attribute with an instance one.
+            self._connection_session = ConnectionSession(
+                connect=lambda: self.open_connection(),
+                policy=self.session_policy(),
+            )
+        return self._connection_session.hold()
 
     @abstractmethod
     def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
@@ -273,6 +250,49 @@ class DatabaseAdapter(ABC):
         ref_table, ref_columns, on_delete, on_update. When `table` is given it
         matches either side (referencing or referenced), so callers can ask both
         "what does X reference?" and "what references X?".
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def index_usage(
+        self,
+        schemas: tuple[str, ...],
+        table: str | None = None,
+        include_fragmentation: bool = False,
+    ) -> AdapterResult:
+        """Return read/write counters per index for the given schema scope.
+
+        Row shape: schema, table, index_name, is_unique, reads, writes_overhead,
+        last_used, size_bytes, never_used, stats_since. `stats_since` is part of
+        the answer, not an extra: every engine resets these counters (restart,
+        failover, index drop/recreate), so `never_used` only means "not used
+        since then" — dropping an index on a window that misses a monthly job is
+        exactly the mistake this column prevents.
+
+        The counters live in engine-specific catalogs that a dialect may not
+        expose at all; where that is the case, return empty data with
+        `status='not_available'` and a warning naming the missing grant rather
+        than raising.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def column_stats(
+        self,
+        schema: str,
+        table: str,
+        column: str | None = None,
+        include_histogram: bool = False,
+    ) -> AdapterResult:
+        """Return optimizer statistics per column for one table.
+
+        Row shape: schema, table, column, kind, distinct_estimate,
+        null_fraction, avg_width, last_analyzed, source. `kind` is 'column' for
+        a single column and 'extended' for a multi-column (correlated) statistic
+        — the latter is what stops the optimizer from multiplying selectivities
+        of related predicates and estimating one row where there are thousands.
+        Columns the dialect cannot express are None rather than faked; dialects
+        add their own extras.
         """
         raise NotImplementedError
 

@@ -111,7 +111,7 @@ class _FailFirstQueryConnection(RecordingConnection):
     The first query fails, as a missing grant would. From then on the connection
     rejects *every* statement with "current transaction is aborted" until someone
     rolls back — which is exactly the trap a shared session walks into, and why
-    `_recover_after_error` exists.
+    the session policy has a `recover` step.
     """
 
     def __init__(self) -> None:
