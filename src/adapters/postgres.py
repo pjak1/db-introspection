@@ -10,8 +10,39 @@ from psycopg.rows import dict_row
 
 from src.adapters._sql_helpers import ORDER_BY_RE, degraded_or_raise, stream_cursor_to_file
 from src.adapters.base import AdapterResult, DatabaseAdapter
+from src.adapters.session import SessionPolicy
 from src.adapters.normalization import normalize_rows
 from src.errors import DatabaseError, ValidationError
+
+
+class _PostgresSessionPolicy:
+    """Read-only enforcement for a PostgreSQL session: a connection-level flag."""
+
+    def begin(self, conn: Any) -> None:
+        """Put the connection in read-only mode for every transaction it starts.
+
+        psycopg refuses to set `read_only` once a transaction is in progress, so
+        this has to happen before the session's first query rather than per query.
+        """
+        conn.read_only = True
+
+    def end(self, conn: Any) -> None:
+        """Discard the read transaction and close the connection."""
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def recover(self, conn: Any) -> None:
+        """Clear the aborted transaction so the session stays usable.
+
+        PostgreSQL rejects every command after a failed one with "current
+        transaction is aborted" until the transaction ends. Without this rollback
+        a single failing query would take down every later query of the same
+        tool call — `health_check`, which degrades per check, depends on it.
+        `read_only` survives the rollback because it applies to new transactions.
+        """
+        conn.rollback()
 
 
 class PostgresAdapter(DatabaseAdapter):
@@ -64,6 +95,10 @@ class PostgresAdapter(DatabaseAdapter):
             raise DatabaseError(
                 "database_error", "PostgreSQL connection failed.", details=str(exc)) from exc
 
+    def session_policy(self) -> SessionPolicy:
+        """Return PostgreSQL's read-only session policy."""
+        return _PostgresSessionPolicy()
+
     def _fetch_all(
         self,
         query: str | sql.Composable,
@@ -73,21 +108,26 @@ class PostgresAdapter(DatabaseAdapter):
         """Execute SQL and return normalized rows as dictionaries.
 
         Read path only. Defense in depth: the connection is put in an
-        engine-enforced read-only transaction, so PostgreSQL itself rejects any
-        write regardless of what the lexical QueryGuard let through.
+        engine-enforced read-only transaction by `_PostgresSessionPolicy`, so
+        PostgreSQL itself rejects any write regardless of what the lexical
+        QueryGuard let through.
         """
         try:
-            with self.open_connection() as conn:
-                conn.read_only = True
+            with self.session() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     if timeout_ms is not None:
                         cur.execute(
                             f"SET LOCAL statement_timeout = {int(timeout_ms)}")
                     cur.execute(query, params or ())
-                    if cur.description is None:
-                        return []
-                    rows = cur.fetchall()
-                    return normalize_rows(rows)
+                    rows = [] if cur.description is None else normalize_rows(cur.fetchall())
+                    if timeout_ms is not None:
+                        # SET LOCAL is transaction-scoped and the transaction now
+                        # spans the whole session, so undo it or it leaks into the
+                        # next query of the same tool call. Only on the success
+                        # path: after a failure the transaction is aborted and the
+                        # session rollback discards the setting anyway.
+                        cur.execute("SET LOCAL statement_timeout = DEFAULT")
+                    return rows
         except psycopg.Error as exc:
             raise DatabaseError(
                 "database_error", "Database query failed.", details=str(exc)) from exc
@@ -306,7 +346,14 @@ class PostgresAdapter(DatabaseAdapter):
             )
 
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-        """List indexes for selected schemas, optionally filtered by table."""
+        """List indexes for selected schemas, optionally filtered by table.
+
+        Key and INCLUDE columns are reported separately: `indkey` holds both and
+        `indnkeyatts` marks where the key ends, so the split is what tells a
+        covering index from a plain one. `is_valid` exposes an index left behind
+        by a failed `CREATE INDEX CONCURRENTLY` — it costs writes and is never
+        used for reads.
+        """
         query = """
             SELECT
                 n.nspname AS schema,
@@ -317,11 +364,20 @@ class PostgresAdapter(DatabaseAdapter):
                 am.amname AS index_type,
                 (
                     SELECT string_agg(
-                        pg_get_indexdef(ix.indexrelid, k.i + 1, true),
+                        pg_get_indexdef(ix.indexrelid, k.i, true),
                         ', ' ORDER BY k.i
                     )
-                    FROM generate_subscripts(ix.indkey, 1) AS k(i)
+                    FROM generate_series(1, ix.indnkeyatts) AS k(i)
                 ) AS columns,
+                (
+                    SELECT string_agg(
+                        pg_get_indexdef(ix.indexrelid, k.i, true),
+                        ', ' ORDER BY k.i
+                    )
+                    FROM generate_series(ix.indnkeyatts + 1, ix.indnatts) AS k(i)
+                ) AS included_columns,
+                ix.indpred IS NOT NULL AS is_partial,
+                ix.indisvalid AS is_valid,
                 pg_get_indexdef(ix.indexrelid) AS definition
             FROM pg_catalog.pg_index ix
             JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
@@ -339,6 +395,203 @@ class PostgresAdapter(DatabaseAdapter):
         data = self._fetch_all(query, tuple(params))
         return AdapterResult(data=data, status="available")
 
+    def index_usage(
+        self,
+        schemas: tuple[str, ...],
+        table: str | None = None,
+        include_fragmentation: bool = False,
+    ) -> AdapterResult:
+        """Return per-index scan counters from pg_stat_all_indexes."""
+        # Counters and the reset timestamp are two queries; one session for both.
+        with self.session():
+            return self._index_usage_in_session(schemas, table, include_fragmentation)
+
+    def _index_usage_in_session(
+        self,
+        schemas: tuple[str, ...],
+        table: str | None,
+        include_fragmentation: bool,
+    ) -> AdapterResult:
+        """Collect index usage rows; assumes a session is already open."""
+        # LEFT JOIN from pg_index so an index with no recorded scan still appears.
+        query = """
+            SELECT
+                n.nspname AS schema,
+                t.relname AS "table",
+                i.relname AS index_name,
+                ix.indisunique AS is_unique,
+                COALESCE(s.idx_scan, 0) AS reads,
+                NULL::bigint AS writes_overhead,
+                NULL::timestamptz AS last_used,
+                pg_relation_size(ix.indexrelid) AS size_bytes,
+                COALESCE(s.idx_scan, 0) = 0 AS never_used,
+                COALESCE(s.idx_tup_read, 0) AS idx_tup_read,
+                COALESCE(s.idx_tup_fetch, 0) AS idx_tup_fetch
+            FROM pg_catalog.pg_index ix
+            JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+            LEFT JOIN pg_catalog.pg_stat_all_indexes s ON s.indexrelid = ix.indexrelid
+            WHERE n.nspname = ANY(%s)
+        """
+        params: list[Any] = [list(schemas)]
+        normalized_table = table.strip() if isinstance(table, str) else None
+        if normalized_table:
+            query += "\n  AND t.relname = %s"
+            params.append(normalized_table)
+        query += '\n            ORDER BY n.nspname, t.relname, i.relname'
+        rows = self._fetch_all(query, tuple(params))
+        stats_since, warnings = self._index_stats_since()
+        for row in rows:
+            row["stats_since"] = stats_since
+        if include_fragmentation:
+            warnings.append(
+                "PostgreSQL exposes no built-in index fragmentation metric; "
+                "install pgstattuple to measure it."
+            )
+        return AdapterResult(data=rows, warnings=warnings, status="available")
+
+    def column_stats(
+        self,
+        schema: str,
+        table: str,
+        column: str | None = None,
+        include_histogram: bool = False,
+    ) -> AdapterResult:
+        """Return per-column planner statistics from pg_stats."""
+        # Column stats and extended statistics are two queries; one session.
+        with self.session():
+            return self._column_stats_in_session(schema, table, column, include_histogram)
+
+    def _column_stats_in_session(
+        self,
+        schema: str,
+        table: str,
+        column: str | None,
+        include_histogram: bool,
+    ) -> AdapterResult:
+        """Collect column and extended statistics; assumes an open session."""
+        # most_common_vals is anyarray and histogram_bounds can be long, so both
+        # are cast to text and only selected when asked for.
+        histogram_select = (
+            """,
+                s.most_common_vals::text AS most_common_vals,
+                s.most_common_freqs::text AS most_common_freqs,
+                s.histogram_bounds::text AS histogram_bounds"""
+            if include_histogram else ""
+        )
+        query = f"""
+            SELECT
+                s.schemaname AS schema,
+                s.tablename AS "table",
+                s.attname AS "column",
+                'column' AS kind,
+                s.n_distinct AS distinct_estimate,
+                s.null_frac AS null_fraction,
+                s.avg_width,
+                to_char(GREATEST(t.last_analyze, t.last_autoanalyze),
+                        'YYYY-MM-DD"T"HH24:MI:SS') AS last_analyzed,
+                'pg_stats' AS source,
+                s.correlation,
+                s.n_distinct < 0 AS distinct_is_fraction{histogram_select}
+            FROM pg_catalog.pg_stats s
+            LEFT JOIN pg_catalog.pg_stat_all_tables t
+              ON t.schemaname = s.schemaname AND t.relname = s.tablename
+            WHERE s.schemaname = %s AND s.tablename = %s
+        """
+        params: list[Any] = [schema, table]
+        if column:
+            query += "\n  AND s.attname = %s"
+            params.append(column)
+        query += "\n            ORDER BY s.attname"
+        rows = self._fetch_all(query, tuple(params))
+        warnings: list[str] = []
+        if not rows:
+            warnings.append(
+                f"No column statistics for '{schema}.{table}'"
+                + (f".{column}" if column else "")
+                + " — the table may not exist, was never analyzed, or is not "
+                "readable by this user."
+            )
+        if any(row.get("distinct_is_fraction") for row in rows):
+            # Documented pg_stats quirk that silently misleads otherwise.
+            warnings.append(
+                "A negative distinct_estimate is PostgreSQL's way of expressing "
+                "distinct values as a fraction of the row count, not a count."
+            )
+        extended, extended_warnings = self._extended_column_stats(schema, table)
+        return AdapterResult(
+            data=rows + extended,
+            warnings=warnings + extended_warnings,
+            status="available" if rows else "not_found",
+        )
+
+    def _extended_column_stats(self, schema: str, table: str) -> tuple[list[dict], list[str]]:
+        """Return CREATE STATISTICS (extended) statistics, or degrade.
+
+        These are what teach the planner that two columns are correlated. The
+        `pg_stats_ext` view is newer than the feature itself, so an older server
+        degrades with a warning instead of failing.
+        """
+        try:
+            rows = self._fetch_all(
+                """
+                SELECT
+                    e.schemaname AS schema,
+                    e.tablename AS "table",
+                    array_to_string(e.attnames, ', ') AS "column",
+                    'extended' AS kind,
+                    NULL::real AS distinct_estimate,
+                    NULL::real AS null_fraction,
+                    NULL::integer AS avg_width,
+                    NULL::text AS last_analyzed,
+                    'pg_stats_ext' AS source,
+                    e.statistics_name,
+                    e.kinds::text AS kinds,
+                    e.n_distinct::text AS extended_n_distinct,
+                    e.dependencies::text AS dependencies
+                FROM pg_catalog.pg_stats_ext e
+                WHERE e.schemaname = %s AND e.tablename = %s
+                ORDER BY e.statistics_name
+                """,
+                (schema, table),
+            )
+        except DatabaseError as exc:
+            details = str(exc.details or "").lower()
+            if "pg_stats_ext" not in details:
+                raise
+            return [], [
+                "Extended statistics are unavailable: pg_stats_ext does not exist "
+                "on this server version."
+            ]
+        return rows, []
+
+    def _index_stats_since(self) -> tuple[Any, list[str]]:
+        """Return when the statistics collector was last reset, plus warnings.
+
+        `never_used` is only meaningful relative to this timestamp. `track_counts`
+        is checked in the same query because with it off nothing is counted at
+        all and every index would look unused.
+        """
+        rows = self._fetch_all(
+            """
+            SELECT
+                s.stats_reset AS stats_since,
+                current_setting('track_counts') AS track_counts
+            FROM pg_catalog.pg_stat_database s
+            WHERE s.datname = current_database()
+            """
+        )
+        if not rows:
+            return None, []
+        warnings: list[str] = []
+        if str(rows[0].get("track_counts", "")).lower() not in {"on", "true", "1"}:
+            warnings.append(
+                "track_counts is off, so index scan counters are not collected; "
+                "every index will look unused."
+            )
+        return rows[0].get("stats_since"), warnings
+
     @staticmethod
     def _ddl_quote(identifier: str) -> str:
         """Double-quote an identifier for inclusion in reconstructed DDL text."""
@@ -353,6 +606,13 @@ class PostgresAdapter(DatabaseAdapter):
         The result is a faithful reconstruction, not necessarily byte-identical to
         the original CREATE.
         """
+        # Columns, constraints and indexes share one session — three logins for
+        # one `db_get_ddl` call would buy nothing.
+        with self.session():
+            return self._table_ddl_in_session(schema, table)
+
+    def _table_ddl_in_session(self, schema: str, table: str) -> AdapterResult:
+        """Assemble the CREATE TABLE text; assumes a session is already open."""
         columns = self._fetch_all(
             """
             SELECT
@@ -787,7 +1047,11 @@ class PostgresAdapter(DatabaseAdapter):
                 "%% of max_connections in use.",
             ),
         ]
-        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        # One session for all checks. Each check still degrades on its own: a
+        # failed query aborts the transaction, and the session policy's recover rolls
+        # it back so the remaining checks can still run.
+        with self.session():
+            rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
         return AdapterResult(data=rows, status="available")
 
     def _run_health_check(self, name: str, sql: str, detail: str) -> dict:

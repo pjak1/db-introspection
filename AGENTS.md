@@ -23,6 +23,8 @@ Use `db_run_select` only as a last resort (fallback) for requests that cannot be
 - Select specific columns from one table: use `db_select_columns`.
 - Export a whole table / a query result to a file (large result sets, "dump to CSV/JSON", thousands of rows): use `db_export_table` / `db_export_query`. They stream to disk and return a summary (path, row_count, byte_size, truncated), not the rows. Prefer these over `format=csv`/`json` on the read tools when the result is large.
 - Performance / slow queries / database health: use `db_top_queries` and `db_health_check` (results depend on the DB user's catalog/DMV privileges).
+- Tuning a specific query — is a predicate selective, are statistics stale: use `db_column_stats`. Multi-column (`kind="extended"`) rows matter for correlated predicates.
+- Is an index used, is it dead weight, what does it cover: use `db_index_usage` and `db_list_indexes`. `db_list_indexes` splits `columns` (key) from `included_columns` (INCLUDE). Read `stats_since` from `db_index_usage` before calling an index unused, and never propose dropping a unique index on those counters.
 - Use `db_run_select` only for advanced queries that specialized tools cannot cover:
   - joins across tables
   - CTE queries

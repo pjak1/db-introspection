@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +14,31 @@ from src.adapters._sql_helpers import (
     stream_cursor_to_file,
 )
 from src.adapters.base import AdapterResult, DatabaseAdapter
+from src.adapters.session import SessionPolicy
 from src.adapters.normalization import normalize_rows
 from src.errors import DatabaseError, ValidationError
+
+
+class _MssqlSessionPolicy:
+    """Read-only enforcement for a SQL Server session: never commit.
+
+    SQL Server has no read-only transaction mode to switch on, so the guarantee
+    rests entirely on `end` rolling back instead of committing.
+    """
+
+    def begin(self, conn: Any) -> None:
+        """No setup; read-only is enforced at the other end by never committing."""
+
+    def end(self, conn: Any) -> None:
+        """Roll the session back — never commit — and close the connection."""
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def recover(self, conn: Any) -> None:
+        """Roll back the failed statement so the session stays usable."""
+        conn.rollback()
 
 
 class MssqlAdapter(DatabaseAdapter):
@@ -252,6 +277,29 @@ class MssqlAdapter(DatabaseAdapter):
             [{"plan_text": row[stmt_index]} for row in fetched_rows]
         )
 
+    def session_policy(self) -> SessionPolicy:
+        """Return SQL Server's read-only session policy."""
+        return _MssqlSessionPolicy()
+
+    @contextmanager
+    def _query_timeout(self, conn: Any, timeout_ms: int | None) -> Iterator[None]:
+        """Apply a timeout for one query only, then restore the old value.
+
+        `timeout` lives on the connection, which is now shared by every query of
+        the same tool call, so it has to be undone — otherwise a timeout set by
+        `run_select` would leak into whatever runs next.
+        """
+        if timeout_ms is None:
+            yield
+            return
+        saved = getattr(conn, "timeout", None)
+        # pyodbc timeouts are whole seconds, so sub-second values round up to 1.
+        conn.timeout = max(1, int(timeout_ms) // 1000)
+        try:
+            yield
+        finally:
+            conn.timeout = saved
+
     def _fetch_all(
         self,
         query: str,
@@ -261,26 +309,21 @@ class MssqlAdapter(DatabaseAdapter):
         """Execute SQL and return normalized rows as dictionaries.
 
         Read path only. SQL Server has no engine-level read-only transaction mode,
-        so read-only is enforced by never committing: the transaction is always
-        rolled back, discarding any side effect a read might have triggered (a
-        plain `with conn` would otherwise commit on exit).
+        so read-only is enforced by never committing: `_MssqlSessionPolicy.end`
+        always rolls the transaction back, discarding any side effect a read might
+        have triggered (a plain `with conn` would otherwise commit on exit).
         """
-        conn = self.open_connection()
         try:
-            if timeout_ms is not None:
-                conn.timeout = max(1, int(timeout_ms) // 1000)
-            with conn.cursor() as cur:
-                cur.execute(query, params or ())
-                rows = rows_from_cursor(cur)
-            conn.rollback()
-            return rows
+            with self.session() as conn:
+                with self._query_timeout(conn, timeout_ms):
+                    with conn.cursor() as cur:
+                        cur.execute(query, params or ())
+                        return rows_from_cursor(cur)
         except DatabaseError:
             raise
         except Exception as exc:
             raise DatabaseError(
                 "database_error", "MSSQL query failed.", details=str(exc)) from exc
-        finally:
-            conn.close()
 
     @staticmethod
     def _in_clause(values: tuple[str, ...]) -> tuple[str, tuple[Any, ...]]:
@@ -356,7 +399,14 @@ class MssqlAdapter(DatabaseAdapter):
         table: str | None = None,
         constraint_type: str | None = None,
     ) -> AdapterResult:
-        """List table constraints with optional filters."""
+        """List table constraints with optional filters.
+
+        The referenced side of a foreign key comes from the `sys` catalogs, not
+        from `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE`: that view reports the
+        columns the constraint is *defined on*, so for a foreign key it names the
+        referencing table, not the referenced one. Non-foreign-key constraints
+        get NULL in the `foreign_*` columns, matching Oracle and PostgreSQL.
+        """
         in_clause, params = self._in_clause(schemas)
         query = f"""
             SELECT
@@ -364,19 +414,36 @@ class MssqlAdapter(DatabaseAdapter):
                 tc.TABLE_NAME AS table_name,
                 tc.CONSTRAINT_NAME AS constraint_name,
                 tc.CONSTRAINT_TYPE AS constraint_type,
-                STRING_AGG(kcu.COLUMN_NAME, ', ') AS columns,
-                ccu.TABLE_SCHEMA AS foreign_table_schema,
-                ccu.TABLE_NAME AS foreign_table_name,
-                STRING_AGG(ccu.COLUMN_NAME, ', ') AS foreign_columns,
+                STRING_AGG(kcu.COLUMN_NAME, ', ')
+                    WITHIN GROUP (ORDER BY kcu.ORDINAL_POSITION) AS columns,
+                fk.ref_schema AS foreign_table_schema,
+                fk.ref_table AS foreign_table_name,
+                fk.ref_columns AS foreign_columns,
                 chk.CHECK_CLAUSE AS check_clause
             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
             LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
               ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
              AND tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
              AND tc.TABLE_NAME = kcu.TABLE_NAME
-            LEFT JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu
-              ON tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
-             AND tc.CONSTRAINT_SCHEMA = ccu.CONSTRAINT_SCHEMA
+            LEFT JOIN (
+                SELECT
+                    f.name AS constraint_name,
+                    SCHEMA_NAME(pt.schema_id) AS constraint_schema,
+                    SCHEMA_NAME(rt.schema_id) AS ref_schema,
+                    rt.name AS ref_table,
+                    (SELECT STRING_AGG(rc.name, ', ')
+                            WITHIN GROUP (ORDER BY fkc.constraint_column_id)
+                     FROM sys.foreign_key_columns fkc
+                     JOIN sys.columns rc
+                       ON rc.object_id = fkc.referenced_object_id
+                      AND rc.column_id = fkc.referenced_column_id
+                     WHERE fkc.constraint_object_id = f.object_id) AS ref_columns
+                FROM sys.foreign_keys f
+                JOIN sys.tables pt ON pt.object_id = f.parent_object_id
+                JOIN sys.tables rt ON rt.object_id = f.referenced_object_id
+            ) fk
+              ON fk.constraint_name = tc.CONSTRAINT_NAME
+             AND fk.constraint_schema = tc.CONSTRAINT_SCHEMA
             LEFT JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS chk
               ON tc.CONSTRAINT_NAME = chk.CONSTRAINT_NAME
              AND tc.CONSTRAINT_SCHEMA = chk.CONSTRAINT_SCHEMA
@@ -388,8 +455,9 @@ class MssqlAdapter(DatabaseAdapter):
                 tc.TABLE_NAME,
                 tc.CONSTRAINT_NAME,
                 tc.CONSTRAINT_TYPE,
-                ccu.TABLE_SCHEMA,
-                ccu.TABLE_NAME,
+                fk.ref_schema,
+                fk.ref_table,
+                fk.ref_columns,
                 chk.CHECK_CLAUSE
             ORDER BY tc.CONSTRAINT_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME
         """
@@ -479,7 +547,14 @@ class MssqlAdapter(DatabaseAdapter):
             )
 
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-        """List indexes for selected schemas, optionally filtered by table."""
+        """List indexes for selected schemas, optionally filtered by table.
+
+        Key and INCLUDE columns are reported separately: `sys.index_columns`
+        stores `key_ordinal = 0` for included columns, so aggregating both into
+        one list sorts the included ones first and makes them indistinguishable
+        from the key — which is exactly the distinction that decides whether an
+        index covers a query.
+        """
         in_clause, params = self._in_clause(schemas)
         query = f"""
             SELECT
@@ -489,24 +564,266 @@ class MssqlAdapter(DatabaseAdapter):
                 ix.is_unique,
                 ix.is_primary_key AS is_primary,
                 ix.type_desc AS index_type,
-                STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns
+                (SELECT STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                 FROM sys.index_columns ic
+                 JOIN sys.columns c
+                   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE ic.object_id = ix.object_id AND ic.index_id = ix.index_id
+                   AND ic.is_included_column = 0) AS columns,
+                (SELECT STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.index_column_id)
+                 FROM sys.index_columns ic
+                 JOIN sys.columns c
+                   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                 WHERE ic.object_id = ix.object_id AND ic.index_id = ix.index_id
+                   AND ic.is_included_column = 1) AS included_columns,
+                ix.filter_definition,
+                ix.is_disabled
             FROM sys.indexes ix
             JOIN sys.tables t ON t.object_id = ix.object_id
-            JOIN sys.index_columns ic
-              ON ic.object_id = ix.object_id AND ic.index_id = ix.index_id
-            JOIN sys.columns c
-              ON c.object_id = ic.object_id AND c.column_id = ic.column_id
             WHERE ix.type > 0
               AND SCHEMA_NAME(t.schema_id) IN ({in_clause})
               AND (? IS NULL OR t.name = ?)
-            GROUP BY SCHEMA_NAME(t.schema_id), t.name, ix.name,
-                     ix.is_unique, ix.is_primary_key, ix.type_desc
             ORDER BY [schema], table_name, index_name
         """
         normalized_table = table.strip() if isinstance(table, str) else None
         bind = params + (normalized_table, normalized_table)
         data = self._fetch_all(query, bind)
         return AdapterResult(data=data, status="available")
+
+    def index_usage(
+        self,
+        schemas: tuple[str, ...],
+        table: str | None = None,
+        include_fragmentation: bool = False,
+    ) -> AdapterResult:
+        """Return per-index read/write counters from dm_db_index_usage_stats."""
+        # Counters and the reset timestamp are two queries that share one session:
+        # the counters need VIEW DATABASE STATE, the timestamp VIEW SERVER STATE,
+        # so the timestamp has to be able to degrade on its own.
+        with self.session():
+            return self._index_usage_in_session(schemas, table, include_fragmentation)
+
+    def _index_usage_in_session(
+        self,
+        schemas: tuple[str, ...],
+        table: str | None,
+        include_fragmentation: bool,
+    ) -> AdapterResult:
+        """Collect index usage rows; assumes a session is already open."""
+        in_clause, params = self._in_clause(schemas)
+        # LEFT JOIN, not JOIN: dm_db_index_usage_stats only holds rows for indexes
+        # touched since the counters were last reset, so an inner join would hide
+        # exactly the never-used indexes this tool exists to find.
+        fragmentation_select = (
+            ",\n                frag.avg_fragmentation_in_percent AS fragmentation_pct"
+            if include_fragmentation else ""
+        )
+        fragmentation_join = (
+            """
+            OUTER APPLY (
+                SELECT MAX(ps.avg_fragmentation_in_percent) AS avg_fragmentation_in_percent
+                FROM sys.dm_db_index_physical_stats(
+                    DB_ID(), ix.object_id, ix.index_id, NULL, 'LIMITED') ps
+            ) frag"""
+            if include_fragmentation else ""
+        )
+        query = f"""
+            SELECT
+                SCHEMA_NAME(t.schema_id) AS [schema],
+                t.name AS [table],
+                ix.name AS index_name,
+                ix.is_unique,
+                COALESCE(ius.user_seeks, 0) + COALESCE(ius.user_scans, 0)
+                    + COALESCE(ius.user_lookups, 0) AS reads,
+                COALESCE(ius.user_updates, 0) AS writes_overhead,
+                (SELECT MAX(v) FROM (VALUES
+                    (ius.last_user_seek), (ius.last_user_scan), (ius.last_user_lookup)
+                 ) AS last_used(v)) AS last_used,
+                (SELECT SUM(a.used_pages) * 8 * 1024
+                 FROM sys.partitions p
+                 JOIN sys.allocation_units a ON a.container_id = p.partition_id
+                 WHERE p.object_id = ix.object_id AND p.index_id = ix.index_id) AS size_bytes,
+                CASE WHEN COALESCE(ius.user_seeks, 0) + COALESCE(ius.user_scans, 0)
+                          + COALESCE(ius.user_lookups, 0) = 0
+                     THEN 1 ELSE 0 END AS never_used,
+                COALESCE(ius.user_seeks, 0) AS user_seeks,
+                COALESCE(ius.user_scans, 0) AS user_scans,
+                COALESCE(ius.user_lookups, 0) AS user_lookups{fragmentation_select}
+            FROM sys.indexes ix
+            JOIN sys.tables t ON t.object_id = ix.object_id
+            LEFT JOIN sys.dm_db_index_usage_stats ius
+              ON ius.object_id = ix.object_id
+             AND ius.index_id = ix.index_id
+             AND ius.database_id = DB_ID(){fragmentation_join}
+            WHERE ix.type > 0
+              AND SCHEMA_NAME(t.schema_id) IN ({in_clause})
+              AND (? IS NULL OR t.name = ?)
+            ORDER BY [schema], [table], index_name
+        """
+        normalized_table = table.strip() if isinstance(table, str) else None
+        bind = params + (normalized_table, normalized_table)
+        try:
+            rows = self._fetch_all(query, bind)
+        except DatabaseError as exc:
+            details = str(exc.details or "").lower()
+            return degraded_or_raise(
+                exc,
+                matched=self._is_permission_error(details),
+                warning=(
+                    "SQL Server index usage statistics require VIEW DATABASE STATE; "
+                    "they are unavailable for this user."
+                ),
+            )
+        stats_since, warnings = self._index_stats_since()
+        for row in rows:
+            row["stats_since"] = stats_since
+        return AdapterResult(data=rows, warnings=warnings, status="available")
+
+    def column_stats(
+        self,
+        schema: str,
+        table: str,
+        column: str | None = None,
+        include_histogram: bool = False,
+    ) -> AdapterResult:
+        """Return statistics objects for one table, with staleness counters.
+
+        SQL Server's catalog exposes no per-column distinct count or null
+        fraction, so those stay None unless `include_histogram` is set, which
+        derives them by walking `dm_db_stats_histogram`. What the catalog does
+        give — and what usually explains a bad plan — is `modification_counter`:
+        rows changed since the statistic was last updated.
+        """
+        with self.session():
+            return self._column_stats_in_session(schema, table, column, include_histogram)
+
+    def _column_stats_in_session(
+        self,
+        schema: str,
+        table: str,
+        column: str | None,
+        include_histogram: bool,
+    ) -> AdapterResult:
+        """Collect statistics rows for one table; assumes an open session."""
+        # A statistic over two or more columns IS the extended statistic here, so
+        # `kind` is derived from the column count rather than a separate query.
+        column_list = """
+                (SELECT STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY sc.stats_column_id)
+                 FROM sys.stats_columns sc
+                 JOIN sys.columns c
+                   ON c.object_id = sc.object_id AND c.column_id = sc.column_id
+                 WHERE sc.object_id = s.object_id AND sc.stats_id = s.stats_id)"""
+        if include_histogram:
+            derived_select = """
+                hist.distinct_estimate,
+                CASE WHEN sp.[rows] > 0
+                     THEN hist.null_rows * 1.0 / sp.[rows] END AS null_fraction"""
+            derived_join = """
+            OUTER APPLY (
+                SELECT SUM(h.distinct_range_rows) + COUNT(*) AS distinct_estimate,
+                       SUM(CASE WHEN h.range_high_key IS NULL
+                                THEN h.equal_rows ELSE 0 END) AS null_rows
+                FROM sys.dm_db_stats_histogram(s.object_id, s.stats_id) h
+            ) hist"""
+        else:
+            derived_select = """
+                CAST(NULL AS bigint) AS distinct_estimate,
+                CAST(NULL AS decimal(18, 6)) AS null_fraction"""
+            derived_join = ""
+        query = f"""
+            SELECT
+                SCHEMA_NAME(t.schema_id) AS [schema],
+                t.name AS [table],
+                {column_list.strip()} AS [column],
+                CASE WHEN (SELECT COUNT(*) FROM sys.stats_columns sc
+                           WHERE sc.object_id = s.object_id
+                             AND sc.stats_id = s.stats_id) > 1
+                     THEN 'extended' ELSE 'column' END AS kind,{derived_select},
+                CAST(NULL AS int) AS avg_width,
+                CONVERT(varchar(19), sp.last_updated, 126) AS last_analyzed,
+                'sys.dm_db_stats_properties' AS source,
+                s.name AS stats_name,
+                s.auto_created AS is_auto_created,
+                s.has_filter,
+                sp.[rows] AS table_rows,
+                sp.rows_sampled,
+                sp.modification_counter,
+                sp.steps
+            FROM sys.stats s
+            JOIN sys.tables t ON t.object_id = s.object_id
+            OUTER APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp{derived_join}
+            WHERE SCHEMA_NAME(t.schema_id) = ? AND t.name = ?
+              AND (? IS NULL OR EXISTS (
+                    SELECT 1
+                    FROM sys.stats_columns sc
+                    JOIN sys.columns c
+                      ON c.object_id = sc.object_id AND c.column_id = sc.column_id
+                    WHERE sc.object_id = s.object_id AND sc.stats_id = s.stats_id
+                      AND c.name = ?))
+            ORDER BY kind, [column]
+        """
+        try:
+            rows = self._fetch_all(query, (schema, table, column, column))
+        except DatabaseError as exc:
+            details = str(exc.details or "").lower()
+            return degraded_or_raise(
+                exc,
+                matched=self._is_permission_error(details),
+                warning=(
+                    "SQL Server statistics metadata requires VIEW DATABASE STATE; "
+                    "it is unavailable for this user."
+                ),
+            )
+        if not rows:
+            return AdapterResult(
+                data=[],
+                warnings=[
+                    f"No statistics for '{schema}.{table}'"
+                    + (f".{column}" if column else "")
+                    + " — the table may not exist or has no statistics objects."
+                ],
+                status="not_found",
+            )
+        warnings = [] if include_histogram else [
+            "distinct_estimate and null_fraction are not in the SQL Server catalog; "
+            "pass include_histogram=true to derive them from the histogram."
+        ]
+        return AdapterResult(data=rows, warnings=warnings, status="available")
+
+    @staticmethod
+    def _is_permission_error(details: str) -> bool:
+        """Recognize a permission denial in a driver error message."""
+        return (
+            "permission" in details
+            or "denied" in details
+            or "(297)" in details
+            or "view server state" in details
+            or "view database state" in details
+        )
+
+    def _index_stats_since(self) -> tuple[str | None, list[str]]:
+        """Return when the usage counters were last reset, plus any warning.
+
+        The counters restart from zero whenever the database goes offline
+        (service restart, failover) and when an index is dropped or recreated
+        with DROP_EXISTING, so a `never_used` verdict is only as old as this
+        timestamp. Needs VIEW SERVER STATE, which is a stricter grant than the
+        counters themselves, hence the independent degrade.
+        """
+        try:
+            rows = self._fetch_all(
+                "SELECT sqlserver_start_time AS stats_since FROM sys.dm_os_sys_info"
+            )
+        except DatabaseError as exc:
+            details = str(exc.details or "").lower()
+            if not self._is_permission_error(details):
+                raise
+            return None, [
+                "Counter reset time needs VIEW SERVER STATE; 'never_used' cannot be "
+                "dated for this user."
+            ]
+        stats_since = rows[0].get("stats_since") if rows else None
+        return stats_since, []
 
     @staticmethod
     def _format_column_type(row: dict) -> str:
@@ -702,6 +1019,13 @@ class MssqlAdapter(DatabaseAdapter):
         result is a faithful reconstruction, not necessarily byte-identical to the
         original CREATE.
         """
+        # Columns, keys, foreign keys, checks and indexes share one session —
+        # five logins for one `db_get_ddl` call would buy nothing.
+        with self.session():
+            return self._table_ddl_in_session(schema, table)
+
+    def _table_ddl_in_session(self, schema: str, table: str) -> AdapterResult:
+        """Assemble the CREATE TABLE text; assumes a session is already open."""
         column_lines = self._ddl_column_lines(schema, table)
         if not column_lines:
             return AdapterResult(
@@ -1045,15 +1369,9 @@ class MssqlAdapter(DatabaseAdapter):
             data = self._fetch_all(query, (int(limit),))
         except DatabaseError as exc:
             details = str(exc.details or "").lower()
-            matched = (
-                "permission" in details
-                or "denied" in details
-                or "(297)" in details
-                or "view server state" in details
-            )
             return degraded_or_raise(
                 exc,
-                matched=matched,
+                matched=self._is_permission_error(details),
                 warning=(
                     "SQL Server query-stats DMVs require VIEW SERVER STATE; top "
                     "queries are unavailable for this user."
@@ -1091,7 +1409,10 @@ class MssqlAdapter(DatabaseAdapter):
                 "tables stored as heaps (no clustered index).",
             ),
         ]
-        rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
+        # One session for all checks: they run sequentially anyway, so a login
+        # per check would buy nothing.
+        with self.session():
+            rows = [self._run_health_check(name, sql, detail) for name, sql, detail in checks]
         return AdapterResult(data=rows, status="available")
 
     def _run_health_check(self, name: str, sql: str, detail: str) -> dict:

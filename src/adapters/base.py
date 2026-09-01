@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
+
+from src.adapters.session import ConnectionSession, SessionPolicy
 
 
 @dataclass
@@ -20,6 +23,9 @@ class DatabaseAdapter(ABC):
     """Abstract contract for DB-specific metadata and query operations."""
     dialect_name: ClassVar[str | None] = None
     _registry: ClassVar[dict[str, type["DatabaseAdapter"]]] = {}
+    # None until `session()` builds it, then shadowed per instance. Declared here
+    # so the contract needs no __init__ of its own.
+    _connection_session: ConnectionSession | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Auto-register subclasses by normalized dialect name."""
@@ -81,7 +87,15 @@ class DatabaseAdapter(ABC):
 
     @abstractmethod
     def list_indexes(self, schemas: tuple[str, ...], table: str | None = None) -> AdapterResult:
-        """List indexes for the given schema scope, optionally filtered by table."""
+        """List indexes for the given schema scope, optionally filtered by table.
+
+        Row shape: schema, table_name, index_name, is_unique, is_primary,
+        index_type, columns, included_columns. `columns` holds the key columns in
+        key order and nothing else; `included_columns` holds the INCLUDE/covering
+        columns, or NULL on dialects without that concept. Keeping them apart is
+        what makes the result usable for covering-index decisions. Dialects add
+        their own extras on top (clustering_factor, filter_definition, is_valid…).
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -109,6 +123,33 @@ class DatabaseAdapter(ABC):
     def open_connection(self) -> Any:
         """Open a new read/write-capable DBAPI connection (implemented per dialect)."""
         raise NotImplementedError
+
+    @abstractmethod
+    def session_policy(self) -> SessionPolicy:
+        """Return this dialect's session setup and teardown policy.
+
+        The connection lifecycle itself lives in `ConnectionSession`; this is the
+        one dialect-specific part of it, so it is the only part the contract asks
+        an adapter for.
+        """
+        raise NotImplementedError
+
+    def session(self) -> AbstractContextManager[Any]:
+        """Hold one connection for one logical operation; see `ConnectionSession`.
+
+        Reentrant, so a method that fans out into several queries pays one login
+        instead of one per query.
+        """
+        if self._connection_session is None:
+            # Built on first use rather than in an __init__: the policy may need
+            # adapter state that a subclass sets up in its own constructor, and
+            # this way no adapter has to remember to call super().__init__().
+            # Assigning here shadows the class attribute with an instance one.
+            self._connection_session = ConnectionSession(
+                connect=lambda: self.open_connection(),
+                policy=self.session_policy(),
+            )
+        return self._connection_session.hold()
 
     @abstractmethod
     def list_tables(self, schemas: tuple[str, ...], include_system: bool) -> AdapterResult:
@@ -209,6 +250,49 @@ class DatabaseAdapter(ABC):
         ref_table, ref_columns, on_delete, on_update. When `table` is given it
         matches either side (referencing or referenced), so callers can ask both
         "what does X reference?" and "what references X?".
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def index_usage(
+        self,
+        schemas: tuple[str, ...],
+        table: str | None = None,
+        include_fragmentation: bool = False,
+    ) -> AdapterResult:
+        """Return read/write counters per index for the given schema scope.
+
+        Row shape: schema, table, index_name, is_unique, reads, writes_overhead,
+        last_used, size_bytes, never_used, stats_since. `stats_since` is part of
+        the answer, not an extra: every engine resets these counters (restart,
+        failover, index drop/recreate), so `never_used` only means "not used
+        since then" — dropping an index on a window that misses a monthly job is
+        exactly the mistake this column prevents.
+
+        The counters live in engine-specific catalogs that a dialect may not
+        expose at all; where that is the case, return empty data with
+        `status='not_available'` and a warning naming the missing grant rather
+        than raising.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def column_stats(
+        self,
+        schema: str,
+        table: str,
+        column: str | None = None,
+        include_histogram: bool = False,
+    ) -> AdapterResult:
+        """Return optimizer statistics per column for one table.
+
+        Row shape: schema, table, column, kind, distinct_estimate,
+        null_fraction, avg_width, last_analyzed, source. `kind` is 'column' for
+        a single column and 'extended' for a multi-column (correlated) statistic
+        — the latter is what stops the optimizer from multiplying selectivities
+        of related predicates and estimating one row where there are thousands.
+        Columns the dialect cannot express are None rather than faked; dialects
+        add their own extras.
         """
         raise NotImplementedError
 

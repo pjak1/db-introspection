@@ -335,7 +335,13 @@ def db_export_table(
 def db_list_indexes(connection: str, schema: str, table: str | None = None) -> Envelope:
     """List indexes in the allowed schema scope, optionally filtered by table.
 
-    Returns index name, uniqueness, primary-key flag, type and indexed columns.
+    Returns index name, uniqueness, primary-key flag, type, and the indexed
+    columns split into `columns` (key columns, in key order) and
+    `included_columns` (INCLUDE/covering columns; NULL on Oracle, which has no
+    such clause). An index covers a query only when the filtered/joined columns
+    are in `columns` — `included_columns` are payload only. Dialects add extras:
+    `clustering_factor`/`distinct_keys` on Oracle, `filter_definition` on SQL
+    Server, `is_partial`/`is_valid` on PostgreSQL.
     `connection` is a 'project/environment/schema' key from db_list_connections.
     """
     return _with_services(
@@ -343,6 +349,81 @@ def db_list_indexes(connection: str, schema: str, table: str | None = None) -> E
         lambda introspection_service, _: introspection_service.list_indexes(
             schema=schema,
             table=table,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_index_usage(
+    connection: str,
+    schema: str,
+    table: str | None = None,
+    include_fragmentation: bool = False,
+) -> Envelope:
+    """Report how much each index is actually read versus the writes it costs.
+
+    Use it to find indexes that earn nothing (`never_used`) and to see which
+    index a table's reads go through. Returns schema, table, index_name,
+    is_unique, reads, writes_overhead, last_used, size_bytes, never_used and
+    stats_since; SQL Server adds the seek/scan/lookup split, PostgreSQL the
+    tuple counters.
+
+    ALWAYS read `stats_since` before acting on `never_used`: the counters restart
+    from zero on restart/failover and on index drop-recreate, so an index unused
+    since yesterday may be critical to a monthly job. Never drop a unique index
+    on this evidence — it enforces a constraint regardless of reads.
+    `include_fragmentation` adds SQL Server fragmentation but scans index
+    metadata, so it is markedly slower; omit it unless you need it.
+    Not available on Oracle (needs SELECT_CATALOG_ROLE or write-enabled index
+    monitoring); returns empty data with a warning there.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.index_usage(
+            schema=schema,
+            table=table,
+            include_fragmentation=include_fragmentation,
+        ),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def db_column_stats(
+    connection: str,
+    schema: str,
+    table: str = "",
+    column: str | None = None,
+    include_histogram: bool = False,
+) -> Envelope:
+    """Report the optimizer statistics behind a table's row estimates.
+
+    Use it to judge whether a predicate is selective enough to be worth an index
+    and whether the statistics are fresh enough to be trusted. Returns schema,
+    table, column, kind, distinct_estimate, null_fraction, avg_width,
+    last_analyzed and source; `column` narrows it to one column.
+
+    `kind` is 'column' or 'extended'. An 'extended' row is a multi-column
+    statistic — without one, the optimizer multiplies the selectivities of
+    correlated predicates (`city = 'Praha' AND country = 'CZ'`) and estimates a
+    handful of rows where there are thousands, which is a common cause of a wrong
+    join choice.
+
+    Per dialect: Oracle returns exact gathered counts plus column groups;
+    PostgreSQL adds `correlation`, and a NEGATIVE `distinct_estimate` there means
+    a fraction of the row count, not a count. SQL Server has no distinct/null in
+    its catalog, so those are null unless `include_histogram=true` derives them
+    from the histogram; it always returns `modification_counter` (rows changed
+    since the last update), which is the fastest way to spot stale statistics.
+    `connection` is a 'project/environment/schema' key from db_list_connections.
+    """
+    return _with_services(
+        connection,
+        lambda introspection_service, _: introspection_service.column_stats(
+            schema=schema,
+            table=table,
+            column=column,
+            include_histogram=include_histogram,
         ),
     )
 

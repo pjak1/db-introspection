@@ -6,6 +6,7 @@ from src.services.export import (
     effective_export_limit,
     normalize_export_format,
     normalize_output_format,
+    prune_export_dir_async,
     resolve_export_path,
     serialize_rows,
 )
@@ -94,6 +95,7 @@ class SelectService:
         effective_max, warnings = effective_export_limit(
             max_rows, self._settings.max_export_rows)
         destination = resolve_export_path(filename, fmt, default_stem="query_export")
+        prune_export_dir_async()
         result = self._adapter.export_query(
             sql_query=validated_sql,
             destination=destination,

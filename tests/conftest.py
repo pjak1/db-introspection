@@ -5,7 +5,21 @@ from pathlib import Path
 import pytest
 
 from src.adapters.base import AdapterResult, DatabaseAdapter
+from src.adapters.session import SessionPolicy
 from src.config import Settings
+
+
+class _NoopSessionPolicy:
+    """Session policy for stubs: close the connection, nothing dialect-specific."""
+
+    def begin(self, conn) -> None:  # noqa: ANN001
+        pass
+
+    def end(self, conn) -> None:  # noqa: ANN001
+        conn.close()
+
+    def recover(self, conn) -> None:  # noqa: ANN001
+        pass
 
 
 class BaseStubAdapter(DatabaseAdapter):
@@ -24,6 +38,9 @@ class BaseStubAdapter(DatabaseAdapter):
 
     def open_connection(self):
         raise NotImplementedError
+
+    def session_policy(self) -> SessionPolicy:
+        return _NoopSessionPolicy()
 
     def list_tables(self, schemas, include_system) -> AdapterResult:
         return AdapterResult(data=[])
@@ -53,6 +70,12 @@ class BaseStubAdapter(DatabaseAdapter):
         return AdapterResult(data=[])
 
     def list_indexes(self, schemas, table=None) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def index_usage(self, schemas, table=None, include_fragmentation=False) -> AdapterResult:
+        return AdapterResult(data=[])
+
+    def column_stats(self, schema, table, column=None, include_histogram=False) -> AdapterResult:
         return AdapterResult(data=[])
 
     def get_ddl(self, schema, object_name, object_type) -> AdapterResult:
@@ -92,6 +115,75 @@ class BaseStubAdapter(DatabaseAdapter):
             "path": str(destination), "format": fmt,
             "row_count": 0, "byte_size": 0, "truncated": False,
         }, schema_used=schema)
+
+
+class RecordingConnection:
+    """A connection fake that records what a session did to it.
+
+    Enough surface for `DatabaseAdapter.session()`: the dialect hooks call
+    `rollback()`/`close()`, Oracle's `begin` runs a cursor statement and
+    Postgres' sets `read_only`. Tests use `executed` to assert how many times the
+    read-only setup ran, which is how "one connection per tool call" is verified.
+    """
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+        self.read_only: bool | None = None
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+        self.call_timeout: int | None = None
+        self.timeout: int | None = None
+
+    def cursor(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return _RecordingCursor(self)
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+class _RecordingCursor:
+    """Minimal cursor that appends every executed statement to its connection."""
+
+    def __init__(self, conn: RecordingConnection) -> None:
+        self._conn = conn
+        self.description = None
+
+    def execute(self, query, params=None):  # noqa: ANN001
+        self._conn.executed.append(str(query))
+
+    def fetchall(self):
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+def stub_session(adapter) -> RecordingConnection:  # noqa: ANN001
+    """Give `adapter` a fake connection so `session()` never reaches a database.
+
+    Needed by tests that patch `_fetch_all`: methods which fan out into several
+    queries now open the session themselves, above that seam. Returns the shared
+    connection so a test can assert on it.
+    """
+    conn = RecordingConnection()
+    adapter.open_connection = lambda: conn  # type: ignore[method-assign]
+    return conn
 
 
 _SETTINGS_DEFAULTS = dict(
